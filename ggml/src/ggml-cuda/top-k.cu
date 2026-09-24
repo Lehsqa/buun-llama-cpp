@@ -39,7 +39,9 @@ static __global__ void stable_top_k_collect_ties(
     const int end = min(begin + stable_top_k_chunk, ncols);
     int stored = 0;
     int * out = tie_ids + (size_t) work * k;
-    for (int base = begin; base < end; base += warpSize) {
+    // step by the launched width, not warpSize: the kernel runs WARP_SIZE (32) threads, which on a
+    // wave64 GPU is half a wavefront, so stepping by warpSize (64) skipped half of every chunk
+    for (int base = begin; base < end; base += blockDim.x) {
         const int id = base + lane;
         const unsigned long long mask = __ballot_sync(0xffffffffULL,
                 id < end && row_src[id] == threshold);
@@ -148,7 +150,7 @@ static int next_power_of_2(int x) {
 
 #endif                            // CUB_TOP_K_AVAILABLE
 
-#if defined(CUB_TOP_K_AVAILABLE) || (!defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP))
+#if defined(GGML_CUDA_USE_CUB) || defined(GGML_USE_HIP)
 
 static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
     const uint32_t bits = __float_as_uint(value);
@@ -308,7 +310,7 @@ static void top_k_radix_cuda(
             src, dst, states, ncols, k, blocks_per_row);
 }
 
-#endif // Batched radix selection: CUDA with DeviceTopK, or HIP without CUB.
+#endif // Batched radix selection: every CUDA build with CUB, and HIP.
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
@@ -341,29 +343,36 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     }
 #elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
-    // Fall back to argsort + copy
-    const int    ncols_pad      = next_power_of_2(ncols);
-    const size_t shared_mem     = ncols_pad * sizeof(int);
-    const size_t max_shared_mem = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
-    const bool   use_bitonic    = shared_mem <= max_shared_mem && ncols <= 1024;
-    const int    chunk_nrows    = argsort_f32_i32_cuda_cub_chunk_nrows(src0->nb[1], nrows);
+    // CCCL < 3.2 (e.g. CUDA 12.0 ships CUB 2.0) has no DeviceTopK. A full segmented argsort of
+    // every row costs O(n log n) plus ~3 row-sized pool buffers; for wide rows (the QSA indexer
+    // ranks up to n_kv cells per query) a four-pass radix select reads each row five times instead.
+    if (ncols > 1024) {
+        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+    } else {
+        // Fall back to argsort + copy
+        const int    ncols_pad      = next_power_of_2(ncols);
+        const size_t shared_mem     = ncols_pad * sizeof(int);
+        const size_t max_shared_mem = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
+        const bool   use_bitonic    = shared_mem <= max_shared_mem && ncols <= 1024;
+        const int    chunk_nrows    = argsort_f32_i32_cuda_cub_chunk_nrows(src0->nb[1], nrows);
 
-    ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * chunk_nrows);
-    int *                     tmp_dst = temp_dst_alloc.get();
+        ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * chunk_nrows);
+        int *                     tmp_dst = temp_dst_alloc.get();
 
-    for (int64_t i = 0; i < nrows; i += chunk_nrows) {
-        int iter_nrows = std::min((int64_t) chunk_nrows, nrows - i);
+        for (int64_t i = 0; i < nrows; i += chunk_nrows) {
+            int iter_nrows = std::min((int64_t) chunk_nrows, nrows - i);
 
-        if (use_bitonic) {
-            argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
-        } else {
-            argsort_f32_i32_cuda_cub(pool, src0_d, tmp_dst, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
+            if (use_bitonic) {
+                argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
+            } else {
+                argsort_f32_i32_cuda_cub(pool, src0_d, tmp_dst, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
+            }
+            CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), iter_nrows,
+                                         cudaMemcpyDeviceToDevice, stream));
+
+            src0_d += ncols * iter_nrows;
+            dst_d  += k     * iter_nrows;
         }
-        CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), iter_nrows,
-                                     cudaMemcpyDeviceToDevice, stream));
-
-        src0_d += ncols * iter_nrows;
-        dst_d  += k     * iter_nrows;
     }
 #else                             // GGML_CUDA_USE_CUB
 #if defined(GGML_USE_HIP)
