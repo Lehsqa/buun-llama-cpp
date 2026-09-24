@@ -475,6 +475,44 @@ bool llama_memory_hybrid_idx_context::qsa_selection_safe(const llama_ubatch * ub
     return true;
 }
 
+bool llama_memory_hybrid_idx_context::qsa_layout_direct(const llama_ubatch * ubatch, uint32_t ratio, int64_t n_kv) const {
+    GGML_ASSERT(ubatch != nullptr);
+    GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
+    GGML_ASSERT(ratio > 0);
+
+    const int64_t n_ns     = get_n_stream();
+    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t r        = ratio;
+    const int64_t n_blocks = (n_kv + r - 1)/r;
+
+    if (n_ns == 0 || n_tokens % n_ns != 0) {
+        return false;
+    }
+    const int64_t n_tps = n_tokens/n_ns;
+
+    // mirrors the first pass of set_input_qsa: a position outside the window or a position held
+    // by two cells sends that stream to the ranked fallback
+    std::vector<uint8_t> seen((size_t) (r*n_blocks));
+    for (int64_t s = 0; s < n_ns; ++s) {
+        const llama_seq_id seq = ubatch->seq_id[s*n_tps][0];
+        const auto & cells = mem->get_mem_idx()->get_cells(seq);
+
+        std::fill(seen.begin(), seen.end(), 0);
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (cells.is_empty(j) || !cells.seq_has((uint32_t) j, seq)) {
+                continue;
+            }
+            const llama_pos p = cells.pos_get(j);
+            if (p < 0 || p/r >= n_blocks || seen[p]) {
+                return false;
+            }
+            seen[p] = 1;
+        }
+    }
+
+    return true;
+}
+
 void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
@@ -485,7 +523,10 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         bool blk_bias) const {
     GGML_ASSERT(mem != nullptr);
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    // block-level selection never reads the per-cell block ids, so the graph may leave cell_blk
+    // unallocated; the layout pass below still needs it as scratch
+    const bool cell_blk_live = cell_blk->buffer != nullptr;
+    GGML_ASSERT(!cell_blk_live || ggml_backend_buffer_is_host(cell_blk->buffer));
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(mem->get_mem_idx() != nullptr);
     GGML_ASSERT(qsa_selection_safe(ubatch));
@@ -499,7 +540,11 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
-    int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
+    std::vector<int32_t> cell_blk_scratch;
+    if (!cell_blk_live) {
+        cell_blk_scratch.resize((size_t) ggml_nelements(cell_blk));
+    }
+    int32_t * dst_cell_blk  = cell_blk_live ? (int32_t *) cell_blk->data : cell_blk_scratch.data();
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
     float   * dst_bias      = (float   *) bias->data;
@@ -562,8 +607,10 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         bool ranked = false;
 
         if (direct) {
-            // Empty gather slots are masked before attention. Pointing them at cell zero keeps the
-            // gather in range; an incomplete block's pooled score is used only for the forced tail.
+            // Empty gather slots are masked before attention. Pointing them at a cell of their own
+            // block (or cell zero for an empty block) keeps the gather in range; an incomplete
+            // block's pooled score is used only for the forced tail. Block-level selection unmasks
+            // every slot of a chosen block, so a slot must never name a cell of another block.
             for (int64_t pb = 0; pb < n_blocks; ++pb) {
                 int32_t rep = -1;
                 bool full = true;
@@ -581,7 +628,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 }
                 for (int64_t slot = 0; slot < r; ++slot) {
                     if (cur_blk_cells[pb*r + slot] < 0) {
-                        cur_blk_cells[pb*r + slot] = 0;
+                        cur_blk_cells[pb*r + slot] = rep >= 0 ? rep : 0;
                     }
                 }
                 pos_at(0, pb) = (int32_t) (pb*r);
@@ -741,8 +788,12 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                         continue;
                     }
 
+                    // Blocks past the tail hold only future cells, which the causal mask removes
+                    // anyway. Excluding them here as well lets a block-level top-k spend its budget
+                    // on visible blocks; the tail itself stays forced even while it is empty.
                     const int64_t block_start = query_ranked ? b*r : pos_at(0, b);
-                    cur_blk_bias[b] = block_start >= tail_start ? 1e9f :
+                    cur_blk_bias[b] = block_start >  tail_start ? -INFINITY :
+                                      block_start == tail_start ? 1e9f :
                         (direct && pos_at(2, b) == 0 ? -INFINITY : 0.0f);
                 }
 

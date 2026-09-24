@@ -148,6 +148,11 @@ public:
     // the current ubatch has one logical sequence; separate physical streams are independent.
     bool qsa_selection_safe(const llama_ubatch * ubatch) const;
 
+    // True when every stream of the ubatch maps each block position to at most one cell inside
+    // the n_kv window: the direct layout of set_input_qsa, whose blk_cells enumerate every cell
+    // of every block. Block-level selection relies on it; M-RoPE (repeated positions) does not.
+    bool qsa_layout_direct(const llama_ubatch * ubatch, uint32_t ratio, int64_t n_kv) const;
+
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
     //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
