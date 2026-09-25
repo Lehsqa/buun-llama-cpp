@@ -3,38 +3,51 @@
 Branch rooted at the production pin `ed774445` (see `HANDOFF.md`), so the only differences from the
 deployed runtime are the commits on this branch plus the kit patches the build script applies.
 
+## Result (measured on the target, 2026-09-25)
+
+All arms use q4_0/q4_0 KV, the default indexer `top_k`, 150k ctx, MTP n_max 3 and 21 CPU expert
+blocks. Each figure is a `bench.py` median of 5 reps, with the boot rep dropped for pp.
+
+| arm | pp6k | pp32k | tg512f | cache hits | cache pools |
+|---|---|---|---|---|---|
+| production runtime, ub768 | 285.9 | 259.5 | 34.4 | 49.9% | 2020 MiB |
+| this branch, ub768 | 279.5 | 255.5 | 36.9 | 64.9% | 3904 MiB |
+| this branch, ub1024 | 332.1 | 302.3 | 35.7 | 63.8% | 3734 MiB |
+| **this branch, ub1280** | **340.5** | **305.2** | **36.5** | 64.0% | 3506 MiB |
+| this branch, ub1536 | 335.3 | 304.7 | 37.6 | 61.2% | 3323 MiB |
+
+**Recommended: `UBATCH_SIZE=1280`.** Against production that is +19% pp6k, +18% pp32k and +6% tg.
+Prefill plateaus above 1280, and the tg spread between the 1024–1536 arms is within draft-acceptance
+noise.
+
+Quality at ub1280: `quality.py` passed 10/10. `longctx.py` at 142 266 tokens, with needles at
+10/50/90%, found 3/3. That long request ran at pp 187.4 t/s and tg 23.7 t/s, against the HANDOFF
+baseline of pp 164.9 and tg 20.8.
+
+Compute buffers (target, from the server log, ub768): CUDA0 1754 → 944 MiB, ROCm0 1649 → 1014 MiB.
+MTP draft CUDA0: 1493 → 498 MiB. ROCm0 free after load: production ub768 591 MiB. On this branch
+it is 1225 / 985 / 745 / 505 MiB at ub 768 / 1024 / 1280 / 1536.
+
 ## What changed
 
 1. **QSA block-level top-k (prefill / scan path)** — `src/models/qwen4exp.cpp`,
    `src/llama-memory-hybrid-idx.*`. The indexer used to expand every block score to its cells and
-   rank all `n_kv` cells per query. That costs several F32 `[n_kv, n_ubatch]` surfaces — each
-   150016 × 736 × 4 B ≈ **421 MiB**, the exact size of the unexplained ub704→736 CUDA0 step — plus a
-   top-k over 150k columns. The scan path now ranks the `n_kv/ratio` blocks directly and expands only
-   the chosen blocks to cells. It selects the forced tail block plus the best `top_k/ratio` whole
-   blocks, which is the reference budget. The old path also took `ratio-1-tail` arbitrary cells
-   from the next tied block. The decode/gather path is unchanged.
-2. **Per-head indexer scoring in prefill** — the 4-head score surface is no longer materialised at once.
-3. **Scan mask without the full add** — selected cells copy their causal-mask value into the `-inf`
-   mask. The result is bit-identical and needs one `[n_kv, n_ubatch]` f16 surface less.
-4. **CUDA top-k radix select for CCCL < 3.2** — CUDA 12.0 ships CUB 2.0.1, so `ggml_top_k` with more
-   than 1024 columns used to run a full segmented argsort plus about 3 row-sized pool buffers. It now
-   uses the same radix select HIP already runs, which also means less VMM pool growth on CUDA0.
-5. **Wave64 fix for stable top-k** — the tie-collection kernel strode by `warpSize` (64 on gfx906)
-   while it was launched with 32 threads, so it skipped half of every chunk.
-
-Dry-run compute buffer at the shipped geometry (CPU-only no_alloc probe, 150k ctx, q4_0 KV,
-ratio 4), so these are graph-allocator numbers and not per-device CUDA0/ROCm0 values:
-
-| ubatch | before | after |
-|---|---|---|
-| 512 | 1137 MiB | 550 MiB |
-| 704 | 1549 MiB | 757 MiB |
-| 736 | 1617 MiB | 791 MiB |
-| 768 | 1686 MiB | 825 MiB |
-| 1536 | 3153 MiB | 1650 MiB |
-
-`LLAMA_QSA_BLOCK_TOPK=0` restores the old per-cell selection with the same binary. Items 3–5 are
-always on. Use that variable for a clean A/B.
+   rank all `n_kv` cells per query. Each of those F32 `[n_kv, n_ubatch]` surfaces is
+   150016 × 736 × 4 B ≈ 421 MiB. The scan path now ranks the `n_kv/ratio` blocks directly and
+   expands only the chosen blocks. It selects the forced tail block plus the best `top_k/ratio`
+   whole blocks, which is the reference budget. The old path also took `ratio-1-tail` arbitrary
+   tied cells. Decode (gather path) is unchanged. `LLAMA_QSA_BLOCK_TOPK=0` restores the old
+   selection.
+2. **Per-head indexer scoring in prefill**, and a scan mask built by copying the selected cells'
+   causal-mask values. The result is bit-identical, with one mask surface less.
+3. **One shared KQ-mask view per graph.** The mask is a host input, and the scheduler copies every
+   distinct view of it to each device, so a per-layer view cost 219 MiB per layer on ROCm0. Find
+   this kind of thing with `GGML_SCHED_DEBUG=2` plus `llama-fit-params --fit-print on -lv 5`.
+4. **MTP draft context ubatch capped at 256** (`LLAMA_MTP_DRAFT_UBATCH`). The draft only replays
+   target hidden rows, but it inherited the target ubatch and reserved like a target prefill graph.
+5. **CUDA radix top-k for CCCL < 3.2.** CUDA 12.0 / CUB 2.0.1 used a full segmented argsort.
+6. **Wave64 fix in the stable top-k tie kernel.** It strode by `warpSize` (64) with 32 launched
+   threads.
 
 ## Build (target host)
 
@@ -44,71 +57,55 @@ cd ~/Projects/buun-opt-src
 BUILD_JOBS=6 bash scripts/rtx-mi50/build.sh      # ~25 min; runtime -> ~/Projects/buun-opt-rtx-mi50/runtime
 ```
 
-The script applies kit patches 0001/0003/0004/0005 from `~/Projects/qwen38-perf/buun-rtx-mi-kit`
-and uses the HANDOFF §3 flags. It merges CUDA `bin/*` and HIP `libggml-hip.so*` into a new runtime,
-then runs `ldd` and `--list-devices`. The production runtime is not touched.
+This applies kit patches 0001/0003/0004/0005 from `~/Projects/qwen38-perf/buun-rtx-mi-kit`, uses
+the HANDOFF §3 flags, and merges CUDA `bin/*` + HIP `libggml-hip.so*` into a new runtime. The
+production runtime is untouched. For incremental rebuilds after `git pull`, most changes touch only
+`libllama` and the server:
 
-Kernel checks:
+```bash
+O=~/Projects/buun-opt-rtx-mi50
+cmake --build $O/cuda -j12 --target llama-server llama-fit-params && cp -a $O/cuda/bin/. $O/runtime/
+```
+
+Only copy libraries while no server from that runtime is running.
+
+## Run
+
+The deployed launcher already has a `BUUN_ROOT` knob. It hardcodes
+`--override-kv qwen4exp.attention.indexer.top_k=int:4096` and defaults the KV to turbo4, which
+are the two unvalidated operator experiments. Run the measured configuration from a copy without
+those:
+
+```bash
+sed 's#^  --override-kv qwen4exp.attention.indexer.top_k=int:4096$#  ${TOPK_OVERRIDE:+--override-kv qwen4exp.attention.indexer.top_k=int:$TOPK_OVERRIDE}#' \
+    ~/Scripts/llama.cpp/RTX+MI_Qwen3.8-Flash-Next.sh > ~/Scripts/llama.cpp/RTX+MI_Qwen3.8-Flash-Next_opt.sh
+BUUN_ROOT=~/Projects/buun-opt-rtx-mi50 KV_K=q4_0 KV_V=q4_0 UBATCH_SIZE=1280 \
+    bash ~/Scripts/llama.cpp/RTX+MI_Qwen3.8-Flash-Next_opt.sh
+```
+
+Estimate per-device memory for any ubatch without loading weights:
 
 ```bash
 R=~/Projects/buun-opt-rtx-mi50/runtime
-export HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0
-$R/test-backend-ops test -b CUDA0 -o TOP_K
-$R/test-backend-ops test -b ROCm0 -o TOP_K
-$R/test-backend-ops test -b CUDA0 -o GET_ROWS
-$R/test-backend-ops test -b CUDA0 -o SET_ROWS
-$R/test-backend-ops test -b CUDA0 -o MUL_MAT_ID
+HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 $R/llama-fit-params --fit-print on -m <model> \
+  -lm mmap -lzm on --mmap-prefetch off -ot '<same -ot as the launcher>' -ngl all \
+  --device CUDA0,ROCm0 -sm layer -ts 3,32 -c 150000 -ctk q4_0 -ctv q4_0 -fa on -b 2048 -ub 1280
 ```
 
-## Launch the new runtime with the deployed launcher
+It prints `device model context compute` in MiB. The MTP draft context is not included.
 
-```bash
-L=~/Scripts/llama.cpp/RTX+MI_Qwen3.8-Flash-Next.sh
-sed 's#buun-rtx-mi-ed774445cd69-cuda/runtime#buun-opt-rtx-mi50/runtime#g' "$L" > /tmp/qwen-opt.sh
-grep -n 'buun-opt-rtx-mi50/runtime' /tmp/qwen-opt.sh     # must show the replaced path
-DRY_RUN=1 bash /tmp/qwen-opt.sh                          # argv check
-```
+## Where prefill time goes now
 
-Only one server can run at a time, so stop the current `:10000` server first. It is running the
-unvalidated turbo4 + `top_k=4096` arm. Use the reference config: q4_0/q4_0 KV and the default `top_k`.
+With ub1280, RTX PCIe RX peaks at 15–20 GB/s but averages ~5 GB/s. Every CPU-resident expert
+matmul is op-offloaded to CUDA0 (backend 0), about 21 GB per ubatch. The CPU is ~92% idle, and the
+RTX mostly waits on the MI50 part of the layer pipeline. Pinning the expert weights would gain
+little. The remaining levers are overlapping the next offloaded layer's weight upload with MI50
+compute, and rebalancing layers between the GPUs.
 
-## A/B plan (medians of ≥5, drop the boot sample)
+## Known limitations
 
-```bash
-B=~/Projects/qwen38-perf/bench.py
-# arm 1: old QSA path, same binary, ub768 (should reproduce HANDOFF §5: 286 / 256 / 34.2)
-LLAMA_QSA_BLOCK_TOPK=0 bash /tmp/qwen-opt.sh
-python3 $B --url http://127.0.0.1:10000 --only pp6k,pp32k,tg512f --reps 5 --tag opt-cell-ub768
-# arm 2: new path, ub768 (cache pools should grow: compare the [moe-cache] pool lines)
-bash /tmp/qwen-opt.sh
-python3 $B --url http://127.0.0.1:10000 --only pp6k,pp32k,tg512f --reps 5 --tag opt-blk-ub768
-# arm 3/4: spend the freed memory on prefill
-UBATCH_SIZE=1024 bash /tmp/qwen-opt.sh   # then the same bench, --tag opt-blk-ub1024
-UBATCH_SIZE=1536 bash /tmp/qwen-opt.sh   # then the same bench, --tag opt-blk-ub1536
-```
-
-In each server log, grep:
-
-```bash
-LOG=~/.local/state/llama-launcher/llama-server-qwen38next-buun.log
-grep -E "compute buffer size|moe-cache\].*(pool|enabled|dormant)|hits" "$LOG"
-```
-
-Look for CUDA0/ROCm0 compute buffers about 0.8–0.9 GiB smaller at ub768, the ub704→736 step gone,
-larger `[moe-cache]` pools, and a higher hit rate. Run quality and long context on the winning arm:
-
-```bash
-python3 ~/Projects/qwen38-perf/buun-rtx-mi-kit/quality.py --url http://127.0.0.1:10000 --tag opt-blk --output /tmp/q.json
-python3 ~/Projects/qwen38-perf/buun-rtx-mi-kit/longctx.py --port 10000 --reps 7900 \
-        --needles PASS-A,PASS-B,PASS-C --positions 0.1,0.5,0.9 --max-tokens 512 --output /tmp/n.json
-```
-
-A follow-up the freed ROCm0 memory may allow: one fewer CPU expert block (each is about 0.9 GiB).
-For example, set `CPU_BLOCKS` to drop layer 31, if ROCm0 has that headroom after arm 2.
-
-## Known limitation
-
-Block selection needs the direct cache layout: one cell per position, which covers all text. An
-M-RoPE image prompt with repeated positions falls back to the per-cell graph, which is ~0.8 GiB
-larger at ub768. That graph is reallocated at runtime, so on a nearly full GPU keep
-`LLAMA_QSA_BLOCK_TOPK=0` if images are served.
+- Block selection needs the direct cache layout: one cell per position, which covers all text.
+  An M-RoPE image prompt falls back to the per-cell graph, which is larger and reallocated at
+  runtime. Keep `LLAMA_QSA_BLOCK_TOPK=0` if images are served on nearly full GPUs.
+- ub1536 fits today with ~0.5 GiB left on ROCm0. Leave that headroom for the hipBLAS handle,
+  which is created lazily at the first prefill.
