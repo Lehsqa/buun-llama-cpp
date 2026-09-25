@@ -886,6 +886,9 @@ public:
     ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
 
+    // blk_cells as [ratio, n_blocks, n_stream], built once for all layers (block selection only)
+    ggml_tensor * cells_of_blk = nullptr;
+
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
     const uint32_t top_k;
@@ -1076,8 +1079,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
         // expand each chosen block to its r cells; a slot of an incomplete block repeats a cell of
         // that same block, which the scan unmasks idempotently
-        ggml_tensor * cells_of_blk = ggml_reshape_3d(ctx0, inp->blk_cells, r, n_blocks, n_stream);
-        ggml_tensor * top_k = ggml_get_rows(ctx0, cells_of_blk, ggml_reshape_2d(ctx0, sel, n_sel*n_tps, n_stream));
+        if (inp->cells_of_blk == nullptr) {
+            // one shared view: each distinct view of a host input is copied to the device separately
+            inp->cells_of_blk = ggml_reshape_3d(ctx0, inp->blk_cells, r, n_blocks, n_stream);
+        }
+        ggml_tensor * top_k = ggml_get_rows(ctx0, inp->cells_of_blk, ggml_reshape_2d(ctx0, sel, n_sel*n_tps, n_stream));
         top_k = ggml_reshape_4d(ctx0, top_k, r*n_sel, n_tps, 1, n_stream);
         cb(top_k, "indexer_top_k", il);
 
@@ -1105,6 +1111,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     cb(top_k, "indexer_top_k", il);
 
     return top_k;
+}
+
+ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask_cells(ggml_tensor * kq_mask, int64_t n_q) {
+    const auto it = qsa_mask_cells.find(kq_mask);
+    if (it != qsa_mask_cells.end()) {
+        GGML_ASSERT(it->second->ne[2] == n_q);
+        return it->second;
+    }
+
+    // rows of size 1 make every cell of a query its own row
+    GGML_ASSERT(kq_mask->nb[3] == kq_mask->nb[1]*kq_mask->ne[1]);
+    GGML_ASSERT(kq_mask->ne[1]*kq_mask->ne[3] == n_q);
+    ggml_tensor * cells = ggml_view_3d(ctx0, kq_mask, 1, kq_mask->ne[0], n_q,
+            kq_mask->nb[0], kq_mask->nb[1], 0);
+    qsa_mask_cells.emplace(kq_mask, cells);
+    return cells;
 }
 
 // Dense GQA self-attention restricted to the cells that top_k names.
@@ -1176,34 +1198,33 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_scan(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
-    // prepare new kq mask - starts filled with -INFINITY
-    ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
+    const int64_t width    = top_k->ne[0];
+    const int64_t n_tps    = top_k->ne[1];
+    const int64_t n_stream = top_k->ne[3];
+    const int64_t n_q      = n_tps*n_stream;
+    const int64_t n_kv     = kq_mask->ne[0];
 
-    // reshape KQ mask into tensor with rows of size 1:
-    // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream]
-    kq_mask_all = ggml_view_4d(ctx0, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3], kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
+    // KQ mask as rows of size 1: [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch*n_stream].
+    // It is the only form of the host mask this path reads, so each device holds one copy of it.
+    ggml_tensor * mask_cells = build_qsa_mask_cells(kq_mask, n_q);
+
+    // prepare new kq mask - starts filled with -INFINITY: [1, n_kv, n_batch, n_stream]
+    ggml_tensor * kq_mask_all = ggml_reshape_4d(ctx0, ggml_fill(ctx0, mask_cells, -INFINITY), 1, n_kv, n_tps, n_stream);
 
     // reshape top_k indices: [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_batch, n_stream, 1]
     ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
 
     // Copy the original mask values of the selected cells instead of unmasking them with zeros and
     // adding the whole mask back: the result is identical (selected: mask, others: -inf), minus one
-    // full [n_kv, n_batch] mask surface. Rows of size 1 make every cell of a query its own row.
-    const int64_t width = top_k->ne[0];
-    const int64_t n_tps = top_k->ne[1];
-    const int64_t n_q   = n_tps*top_k->ne[3];
-    GGML_ASSERT(kq_mask->nb[3] == kq_mask->nb[1]*n_tps);
-    ggml_tensor * mask_cells = ggml_view_3d(ctx0, kq_mask, 1, kq_mask->ne[0], n_q,
-            kq_mask->nb[0], kq_mask->nb[1], 0);
+    // full [n_kv, n_batch] mask surface.
     ggml_tensor * mask_sel = ggml_get_rows(ctx0, mask_cells, ggml_reshape_3d(ctx0, top_k, width, n_q, 1));
-    mask_sel = ggml_reshape_4d(ctx0, mask_sel, 1, width, n_tps, top_k->ne[3]);
+    mask_sel = ggml_reshape_4d(ctx0, mask_sel, 1, width, n_tps, n_stream);
 
     // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
     ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, mask_sel, top_k_3d);
 
-    // reshape to restore the original shape of KQ mask:
-    // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
-    kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
+    // restore the original shape of KQ mask: [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
+    kq_mask_top_k = ggml_reshape_4d(ctx0, kq_mask_top_k, n_kv, n_tps, 1, n_stream);
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
@@ -1258,10 +1279,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_gather(
 
     // Gather the ordinary causal/reachability mask at the same selected cells.
     ggml_tensor * kq_mask = inp->get_kq_mask();
-    GGML_ASSERT(kq_mask->nb[3] == kq_mask->nb[1]*n_tps);
+    GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps);
 
-    ggml_tensor * mask_cells = ggml_view_3d(ctx0, kq_mask, 1, n_kv, n_q,
-            kq_mask->nb[0], kq_mask->nb[1], 0);
+    ggml_tensor * mask_cells = build_qsa_mask_cells(kq_mask, n_q);
     ggml_tensor * idx_query = ggml_reshape_3d(ctx0, top_k, width, n_q, 1);
     ggml_tensor * mask = ggml_get_rows(ctx0, mask_cells, idx_query);
     mask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, mask, width, 1, 1, n_q), GGML_TYPE_F16);
