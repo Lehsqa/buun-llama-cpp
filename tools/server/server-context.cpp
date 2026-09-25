@@ -5223,6 +5223,22 @@ private:
         }
     }
 
+    // The MTP draft replays target hidden rows in n_ubatch chunks and drafts one row per step, so
+    // its compute buffer only has to cover a small chunk. Inheriting the target's n_ubatch sized it
+    // like the target's prefill graph (1493 MiB on the main GPU at 150k x 768 for the Qwen3.8
+    // sidecar), all of it taken from the expert-cache budget. n_batch is left alone: the replay
+    // decode carries up to the target's n_batch rows and llama_decode splits it by n_ubatch.
+    static void bound_mtp_draft_ubatch(llama_context_params & cparams) {
+        uint32_t cap = 256;
+        if (const char * env = getenv("LLAMA_MTP_DRAFT_UBATCH")) {
+            const int v = atoi(env);
+            if (v > 0) {
+                cap = (uint32_t) v;
+            }
+        }
+        cparams.n_ubatch = std::min(cparams.n_ubatch, cap);
+    }
+
     llama_context * create_mtp_context() {
         auto cparams = common_context_params_to_llama(params_base);
         // Auto-fit mutates the target's llama_context_params, not params_base.  Reuse the
@@ -5241,6 +5257,7 @@ private:
         cparams.n_rs_seq      = 0;
         cparams.n_outputs_max = params_base.n_parallel;
         cparams.ctx_other     = ctx_tgt;
+        bound_mtp_draft_ubatch(cparams);
         return llama_init_from_model(model_tgt, cparams);
     }
 
@@ -7141,6 +7158,7 @@ private:
                 cparams.ctx_type   = LLAMA_CONTEXT_TYPE_MTP;
                 cparams.n_rs_seq   = 0;
                 cparams.ctx_other  = ctx_tgt;
+                bound_mtp_draft_ubatch(cparams);
                 ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
                 if (ctx_dft == nullptr) {
                     SRV_ERR("%s", "failed to create draft context\n");
