@@ -299,7 +299,8 @@ void llama_ple_reader::read_rows(const int32_t * rows, size_t n, uint8_t * out) 
         b->pending = jobs.size();
         {
             std::lock_guard<std::mutex> lk(d.mtx);
-            for (auto & j : jobs) d.queue.emplace_back(std::move(j), b);
+            // demand reads go ahead of any queued read-ahead; pushed in reverse so they still pop in offset order
+            for (auto it = jobs.rbegin(); it != jobs.rend(); ++it) d.queue.emplace_front(std::move(*it), b);
         }
         d.cv.notify_all();
         std::unique_lock<std::mutex> lk(b->mtx);
