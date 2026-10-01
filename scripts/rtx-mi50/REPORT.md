@@ -213,3 +213,79 @@ SSH commands time out at 120 s otherwise.
 PLE lazy (`-lm mmap -lzm on --mmap-prefetch off`, no mlock); output head on CUDA0; one server at a time;
 `HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0`; old launchers stay runnable as rollback;
 q4_0/q4_0 KV + default top_k as the reference config; ≥ ~500 MiB free on ROCm0 after load.
+
+---
+
+## 9. Strata port (opt/strata-port)
+
+### 9.1 P0 measurement
+
+Run 2026-10-01 13:11 → 13:53 (all nine arms in ~41 min) by `harness/p0_arms.sh`. Binary: `strata/p0-measure` at
+2539d2487 (adds the `GGML_SCHED_TIMING` summary, off unless the env is set) plus the uncommitted kit patches.
+Reference config as in §2: q4_0/q4_0 KV, ub1280, default top_k, MTP n=3, 21 CPU blocks, cache auto. `summ.py` medians of 5
+(pp: boot rep dropped). Raw files are `~/claude-opt/p0-*.{bench,log,io,fincore,greedy.json}`.
+
+**Reference arm (`p0-ref`)**, timing off:
+
+| arm | pp6k | pp32k | tg512f | accept | cache hits | pools |
+|---|---|---|---|---|---|---|
+| §2 branch, ub1280 | 340.5 | 305.2 | 36.5 | — | 64.0% | 3506 MiB |
+| **p0-ref** | **333.8** | **299.8** | **37.1** | 0.77 | 62.6% | 3506 MiB (iq4_nl 1485 / iq3_s 1291 / iq2_s 730) |
+
+The arm is within run-to-run noise of §2 (pp −2%, tg +2%; per-rep spread pp6k 313.7–338.9, tg 35.6–39.9). Pools are
+identical, so with timing off the timing build changes nothing.
+
+**I/O and residency (`p0-ref`, whole bench window, after load):** `majflt=60593` (system-wide `pgmajfault` delta) and
+`read_bytes=3.26 GiB` (server process). Per request, the first one reads 2191 MiB (cold touch). After that a pp6k reads
+3–77 MiB, a pp32k 7–108 MiB and a tg512f 19–319 MiB. Page-cache residency (`fincore.py`, taken before stop, caches not
+dropped between arms):
+
+| shard(s) | content | resident / size |
+|---|---|---|
+| 00002 | `per_layer_token_embd.weight` (PLE table, lazy mmap) | **67.2 / 36 621 MiB (0.18%)** |
+| 00003–00006, 00022–00033 | CPU expert blocks 0–3, 31–47 (+ token_embd, blk 30 edges) | 22 238 / 26 776 MiB (83%) |
+| 00007–00021 | GPU-resident blocks | 0 / 26 088 MiB |
+| total | | 22 306 / 90 146 MiB |
+
+The PLE table is touched sparsely: lazy rows keep it at ~67 MiB of page cache. The CPU expert shards are almost fully
+cached and account for nearly all residency.
+
+**Prefill timing (`p0-timing`, `GGML_SCHED_TIMING=1`, one 32 008-token request).** It ran at 306.4 t/s, the same as p0-ref
+pp32k, so the per-split synchronisation costs no visible throughput. The log has 271 `sched-timing:` lines: 31 are prefill
+ubatches (84 splits, `wmib>0`), 215 are 2-split MTP-draft graphs (8 per 2048 batch) and 25 are 46-split decode graphs.
+With b2048/ub1280, each batch is a 1280 + 768 ubatch pair. Medians (first ubatch excluded from the per-size rows):
+
+| ubatch | n | in_ms | ids_ms | wmib | cmp_ms CUDA0 | cmp_ms ROCm0 | cmp_ms CPU | sum ms | in_ms share |
+|---|---|---|---|---|---|---|---|---|---|
+| 1280 | 15 | 796.4 | 13.0 | 11 700 | 206.6 | 2737.7 | 2.7 | 3745 | 21.4% |
+| 768 | 15 | 681.4 | 8.2 | 10 866 | 145.7 | 1874.1 | 1.6 | 2712 | 25.5% |
+| all prefill | 31 | 777.5 | 12.8 | 11 090 | 190.2 | 2216.6 | 2.6 | 3222 | **23.3%** |
+
+- `in_ms` is all input copies of a ubatch, including the expert-id readback (`ids_ms`, which is part of `in_ms`). It is
+  **~23% of a prefill ubatch** (21% at 1280, 25% at 768). This sizes P4.
+- `wmib` is the offloaded CPU-expert bytes uploaded to CUDA0: ~11 GiB per ubatch at ~15.7 GB/s effective. It is nearly the
+  same at 768 and 1280 tokens because almost every expert is hit either way, so the upload is a fixed per-ubatch cost.
+- ROCm0 compute dominates (69–73%) and grows with depth (2166 → 3404 ms at 1280 over the 32k prompt). CUDA0 compute is ~5.5%.
+- The timing path synchronises after every split, so these are serial sums. Any real copy/compute overlap is hidden
+  inside them.
+
+**Config items** (single arms, tg512f medians of 5; the noise band is about ±1 t/s):
+
+| item | tg512f | accept | other |
+|---|---|---|---|
+| reference (draft KV f16, p-min 0 = off, `-t 6`) | 37.1 | 0.77 | |
+| draft KV q8_0 (`-ctkd/-ctvd q8_0`) | 36.8 | 0.77 | draft KV 293.0 → 155.7 MiB; CUDA0 cache 3506 → **3645 MiB** (+139), hits 64.1%; pp6k 330.5, pp32k 300.8 |
+| `--draft-p-min 0.3` | 37.0 | 0.78 | |
+| `--draft-p-min 0.5` | 34.0 | 0.85 | |
+| `--draft-p-min 0.7` | 33.9 | 0.92 | |
+| `-t 6 -tb 6` | 37.5 | 0.77 | the launcher already defaults to `THREADS=6`, so this arm is a tg repeat of p0-ref (noise check), not a thread test |
+
+Draft KV q8_0 adds ~139 MiB of expert cache at equal tg and pp, a free memory win. Higher p-min raises acceptance but cuts
+the draft length more than it saves, so tg falls. Keep p-min off.
+
+**Determinism verdict: FAIL, `identical 2/5` with `MOE_CACHE=off`** (`p0-det-a` vs `p0-det-b`; the log confirms
+`MoE cache requested=off resolved=off`). `list` and `long` match. `code` diverges at char 257, `prose` at 467 and
+`math` at 429. Each is a plausible near-tie word choice after a long identical prefix. The expert cache is therefore not
+the only source of run-to-run variation on this host. The remaining source is not identified; MTP n=3 was on, so
+verify-batch shapes vary between runs. **Exactness gates fall back to quality + needles for this host.** Byte-identical
+greedy output cannot be required of a flag-off/flag-on pair.
