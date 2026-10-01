@@ -17,9 +17,9 @@
 # Measured 2026-10-01 (REPORT §9; 150k ctx, q4_0/q4_0 KV, ub 1280, MTP n=3, 21 CPU blocks,
 # cache auto; bench medians of 5, boot sample excluded):
 #   --ple-io mmap   : pp6k 335.2  pp32k 300.2  tg 36.4
-#   --ple-io direct : pp6k 330.6  pp32k 298.8  tg 37.8   (reader hit 99.3%, p50 126 us, blocked 1.1 s total)
+#   --ple-io direct : pp6k 330.6  pp32k 298.8  tg 37.8   (reader hit 99.2%, p50 126 us, blocked 1.1 s total)
 #   direct: quality.py 10/10; 142k needles 3/3. Page cache is no longer filled with PLE pages.
-#   Threads: -t 5 -> tg 36.0, -t 6 -> 37.1, -t 12 -> 29.3, so 6 stays the default.
+#   Threads (tg, same P1 session): -t 5 36.0, -t 6 36.4, -t 12 29.3 -> 5 and 6 are level, 12 loses; 6 stays.
 #   MTP draft KV q8_0: tg 36.8 vs 37.1 (no gain, +139 MiB expert cache); f16 stays the default.
 #   --draft-p-min 0.5/0.7 lose ~3 t/s; not set.
 # Note: greedy output is not run-to-run reproducible on this host even with the cache off (2/5
@@ -171,8 +171,11 @@ case "$PLE_IO" in
   mmap|direct) ;;
   *) echo "ERROR: PLE_IO must be mmap or direct (got '$PLE_IO')" >&2; exit 1 ;;
 esac
-if [[ "$PLE_IO" == "direct" ]] && ! LD_LIBRARY_PATH="$LD_LIBRARY_PATH" "$LLAMA_BIN" --help 2>/dev/null | grep -q -- '--ple-io'; then
-  echo "ERROR: $LLAMA_BIN has no --ple-io option: the runtime predates strata/p1-ple-direct." >&2
+if [[ "$PLE_IO" == "direct" ]]; then
+  HELP_TEXT="$("$LLAMA_BIN" --help 2>/dev/null || true)"
+fi
+if [[ "$PLE_IO" == "direct" && "$HELP_TEXT" != *--ple-io* ]]; then
+  echo "ERROR: '$LLAMA_BIN --help' does not list --ple-io: the runtime predates strata/p1-ple-direct (or did not start)." >&2
   echo "       Rebuild it from a branch with the PLE reader, or run with PLE_IO=mmap." >&2
   exit 1
 fi
