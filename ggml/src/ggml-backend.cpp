@@ -30,6 +30,7 @@ void ggml_moe_cache_unregister(const void * owner) {
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -903,6 +904,16 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    // GGML_SCHED_TIMING=N: per-split wall times, summarised every N graph computes (0 = off).
+    // Synchronises after every split's input copies and compute, so it is a diagnostic, not a profiler.
+    int     timing_every;
+    int     timing_graphs;
+    int     timing_splits;
+    int64_t timing_in_us;
+    int64_t timing_ids_us;
+    size_t  timing_wbytes;
+    int64_t timing_cmp_us[GGML_SCHED_MAX_BACKENDS];
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1705,6 +1716,24 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+static void ggml_backend_sched_timing_flush(ggml_backend_sched_t sched) {
+    std::string cmp;
+    for (int b = 0; b < sched->n_backends; b++) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "%s%s=%.1f", b ? " " : "", ggml_backend_name(sched->backends[b]), sched->timing_cmp_us[b]/1000.0);
+        cmp += buf;
+        sched->timing_cmp_us[b] = 0;
+    }
+    GGML_LOG_INFO("sched-timing: graphs=%d splits=%d in_ms=%.1f ids_ms=%.1f wmib=%.1f cmp_ms[%s]\n",
+            sched->timing_graphs, sched->timing_splits, sched->timing_in_us/1000.0, sched->timing_ids_us/1000.0,
+            sched->timing_wbytes/1048576.0, cmp.c_str());
+    sched->timing_graphs = 0;
+    sched->timing_splits = 0;
+    sched->timing_in_us  = 0;
+    sched->timing_ids_us = 0;
+    sched->timing_wbytes = 0;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1735,11 +1764,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<ggml_bitset_t> used_ids;
 
     int prev_backend_id = -1;
+    const bool timing = sched->timing_every > 0;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const int64_t t_split0 = timing ? ggml_time_us() : 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1807,8 +1838,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
+                        const int64_t t_ids0 = timing ? ggml_time_us() : 0;
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                         ggml_backend_synchronize(ids_backend);
+                        if (timing) {
+                            sched->timing_ids_us += ggml_time_us() - t_ids0;
+                        }
 
                         // find the used experts
                         used_ids.clear();
@@ -1837,6 +1872,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
                             expert_size_copy + padding_end);
+                        sched->timing_wbytes += expert_size_copy + padding_end;
                     };
 
                     int id = 0;
@@ -1882,6 +1918,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        int64_t t_cmp0 = 0;
+        if (timing) {
+            ggml_backend_synchronize(split_backend);
+            t_cmp0 = ggml_time_us();
+            sched->timing_in_us += t_cmp0 - t_split0;
+            sched->timing_splits++;
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1921,12 +1965,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (timing) {
+            ggml_backend_synchronize(split_backend);
+            sched->timing_cmp_us[split_backend_id] += ggml_time_us() - t_cmp0;
+        }
+
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    if (timing && ++sched->timing_graphs >= sched->timing_every) {
+        ggml_backend_sched_timing_flush(sched);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1947,6 +2000,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
+
+    const char * GGML_SCHED_TIMING = getenv("GGML_SCHED_TIMING");
+    sched->timing_every = GGML_SCHED_TIMING ? std::max(0, atoi(GGML_SCHED_TIMING)) : 0;
 
     sched->debug_realloc = 0;
 #ifdef GGML_SCHED_NO_REALLOC
