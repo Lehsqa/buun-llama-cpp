@@ -154,6 +154,8 @@ target_include_directories(test-server-recurrent-expansion PRIVATE ${PROJECT_SOU
 llama_build_and_test(test-kv-cells.cpp)
 target_include_directories(test-kv-cells PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+llama_build_and_test(test-sched-timing.cpp)
+
 llama_build(test-safetensors-registry.cpp)
 target_include_directories(test-safetensors-registry PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_test(test-safetensors-registry)
