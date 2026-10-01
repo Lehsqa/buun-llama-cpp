@@ -225,6 +225,11 @@ extern "C" {
         LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
     };
 
+    enum llama_ple_io {
+        LLAMA_PLE_IO_MMAP   = 0, // gather lazily read PLE rows through the file mapping (page faults)
+        LLAMA_PLE_IO_DIRECT = 1, // positioned reads that bypass the page cache, with a row cache (POSIX; needs a lazily read table)
+    };
+
     enum llama_mmap_prefetch_mode {
         LLAMA_MMAP_PREFETCH_MODE_OFF  = 0,
         LLAMA_MMAP_PREFETCH_MODE_AUTO = 1,
@@ -350,6 +355,9 @@ extern "C" {
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
         enum llama_mmap_prefetch_mode mmap_prefetch; // bulk mmap prefetch policy
         const char * repack_cache; // opt-in prepared safetensors cache directory (Linux; NULL = disposable)
+        enum llama_ple_io ple_io;       // how lazily read PLE rows are fetched
+        uint32_t ple_io_threads;        // reader threads for LLAMA_PLE_IO_DIRECT
+        uint32_t ple_row_cache;         // rows cached by LLAMA_PLE_IO_DIRECT (0 = none)
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

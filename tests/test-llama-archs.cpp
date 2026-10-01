@@ -21,6 +21,7 @@
 #include "../src/llama-model.h"
 #include "../src/llama-model-loader.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-ple-reader.h"
 #include "../src/llama-io.h"
 #include "../src/llama-vbr-artifact-adopt.h"
 #include "../src/llama-vbr-artifact-capture.h"
@@ -4298,6 +4299,138 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
     return all_ok ? 0 : 1;
 }
 
+// --ple-io direct: the reader opens only for a lazily read table on a real load, and falls back otherwise
+static std::string qwen4_save_tmp_model(const size_t seed) {
+    gguf_context_ptr gguf = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    llama_model_params mp = llama_model_default_params();
+    mp.progress_callback = silent_model_load_progress;
+    ggml_backend_dev_t cpu_devices[] = { nullptr };
+    mp.devices = cpu_devices;
+    size_t tmp = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf.get(), set_tensor_data, &tmp, mp));
+    GGML_ASSERT(model != nullptr);
+    GGML_ASSERT(model->per_layer_tok_embd != nullptr);
+    const std::string path = "test-qwen4-ple-io.gguf";
+    llama_model_save_to_file(model.get(), path.c_str());
+    return path;
+}
+
+static llama_model_ptr qwen4_load_ple_io(const std::string & path, llama_lazy_mode lazy, llama_ple_io io) {
+    llama_model_params mp = llama_model_default_params();
+    mp.progress_callback = silent_model_load_progress;
+    ggml_backend_dev_t cpu_devices[] = { nullptr };
+    mp.devices = cpu_devices;
+    mp.lazy_mode = lazy;
+    mp.ple_io = io;
+    mp.ple_io_threads = 4;
+    mp.ple_row_cache = 4096;
+    llama_model_ptr model(llama_model_load_from_file(path.c_str(), mp));
+    GGML_ASSERT(model != nullptr);
+    return model;
+}
+
+static void test_qwen4_ple_io_open(const size_t seed) {
+    const std::string path = qwen4_save_tmp_model(seed);
+    GGML_ASSERT(qwen4_load_ple_io(path, LLAMA_LAZY_MODE_ON,  LLAMA_PLE_IO_DIRECT)->ple_reader != nullptr);
+    GGML_ASSERT(qwen4_load_ple_io(path, LLAMA_LAZY_MODE_ON,  LLAMA_PLE_IO_MMAP)->ple_reader   == nullptr);
+    // not lazily read -> warning + mmap path, never a failed load
+    GGML_ASSERT(qwen4_load_ple_io(path, LLAMA_LAZY_MODE_OFF, LLAMA_PLE_IO_DIRECT)->ple_reader == nullptr);
+    std::remove(path.c_str());
+}
+
+// runs inside the first ubatch's compute, after decode() started the read-ahead and before the next set_input()
+static bool qwen4_ple_drain_cb(ggml_tensor * t, bool ask, void * user_data) {
+    GGML_UNUSED(t); GGML_UNUSED(ask);
+    if (user_data) {
+        static_cast<llama_ple_reader *>(user_data)->wait_idle();
+    }
+    return false;
+}
+
+// mmap and direct PLE reads must give bit-identical logits: text in two 8-token calls, then an embd batch
+// one_call: the 16 text tokens go in one llama_decode split into n_ubatch-sized ubatches (read-ahead of the later ones)
+static std::vector<float> qwen4_ple_io_logits(const std::string & path, llama_ple_io io, uint32_t n_ubatch, bool one_call,
+                                              uint64_t * hits_out) {
+    llama_model_ptr model = qwen4_load_ple_io(path, LLAMA_LAZY_MODE_ON, io);
+    GGML_ASSERT((model->ple_reader != nullptr) == (io == LLAMA_PLE_IO_DIRECT));
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = 64; cp.n_batch = 16; cp.n_ubatch = n_ubatch; cp.n_threads = 2; cp.n_threads_batch = 2;
+    if (one_call) {
+        // drain the reader during compute so the read-ahead deterministically lands before the next ubatch reads its rows
+        cp.cb_eval = qwen4_ple_drain_cb;
+        cp.cb_eval_user_data = model->ple_reader.get();
+    }
+    llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+    GGML_ASSERT(ctx != nullptr);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const int n_embd  = llama_model_n_embd(model.get());
+    std::vector<float> all;
+
+    llama_batch b = llama_batch_init(16, 0, 1);
+    if (one_call) {
+        // (i*3 + 22) % 128 avoids EOS (0) and gives 64 distinct PLE rows in the test table, so a hit can only come from the read-ahead
+        b.n_tokens = 16;
+        for (int i = 0; i < 16; ++i) {
+            b.token[i] = (i*3 + 22) % n_vocab; b.pos[i] = i; b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = 1;
+        }
+        GGML_ASSERT(llama_decode(ctx.get(), b) == 0);
+        // the equal-sized later ubatches reuse the graph, so the PLE input must be refilled each time (parity checks it)
+        // (the two-call run cannot show this: the first ubatch zeroes the recurrent state, rs_z, and blocks reuse)
+        GGML_ASSERT(llama_perf_context(ctx.get()).n_reused >= 1);
+        if (hits_out && model->ple_reader) {
+            *hits_out = model->ple_reader->stats().hits;
+        }
+        const float * l = llama_get_logits(ctx.get());
+        all.insert(all.end(), l, l + 16*n_vocab);
+    } else {
+        for (int call = 0; call < 2; ++call) {
+            b.n_tokens = 8;
+            for (int i = 0; i < 8; ++i) {
+                b.token[i] = (call*8 + i*5 + 3) % n_vocab; b.pos[i] = call*8 + i; b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = 1;
+            }
+            GGML_ASSERT(llama_decode(ctx.get(), b) == 0);
+            const float * l = llama_get_logits(ctx.get());
+            all.insert(all.end(), l, l + 8*n_vocab);
+        }
+    }
+    llama_batch_free(b);
+
+    // IMROPE: an embd batch carries n_pos_per_embd (4) positions per token, laid out section-major
+    const int n_pos = 4;
+    llama_batch e = llama_batch_init(4*n_pos, n_embd, 1);
+    e.n_tokens = 4;
+    for (int i = 0; i < 4; ++i) {
+        for (int k = 0; k < n_embd; ++k) e.embd[i*n_embd + k] = 0.01f*float((i*7 + k*3) % 13 - 6);
+        for (int j = 0; j < n_pos; ++j) e.pos[j*4 + i] = 16 + i;
+        e.n_seq_id[i] = 1; e.seq_id[i][0] = 0; e.logits[i] = 1;
+    }
+    GGML_ASSERT(llama_decode(ctx.get(), e) == 0);
+    GGML_ASSERT(io == LLAMA_PLE_IO_MMAP || model->ple_reader->stats().rows > 0);
+    const float * l = llama_get_logits(ctx.get());
+    all.insert(all.end(), l, l + 4*n_vocab);
+    llama_batch_free(e);
+    return all;
+}
+
+static void test_qwen4_ple_io_parity(const size_t seed) {
+    const std::string path = qwen4_save_tmp_model(seed);
+    const auto a = qwen4_ple_io_logits(path, LLAMA_PLE_IO_MMAP,   8, false, nullptr);
+    const auto b = qwen4_ple_io_logits(path, LLAMA_PLE_IO_DIRECT, 8, false, nullptr);
+    GGML_ASSERT(a.size() == b.size());
+    GGML_ASSERT(memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0);
+
+    // one 16-token decode in four ubatches: the read-ahead puts the rows of ubatches 2-4 in the cache before set_input
+    uint64_t hits = 0;
+    const auto c = qwen4_ple_io_logits(path, LLAMA_PLE_IO_MMAP,   4, true, nullptr);
+    const auto d = qwen4_ple_io_logits(path, LLAMA_PLE_IO_DIRECT, 4, true, &hits);
+    GGML_ASSERT(c.size() == d.size());
+    GGML_ASSERT(memcmp(c.data(), d.data(), c.size()*sizeof(float)) == 0);
+    GGML_ASSERT(hits > 0);
+    // exactly every row of tokens 4..15 (4 PLE heads each): the read-ahead mirrors set_input's windows
+    GGML_ASSERT(hits == (16 - 4)*4);
+    std::remove(path.c_str());
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -4374,6 +4507,10 @@ int main(int argc, char ** argv) {
         }
         if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN4EXP) {
             test_qwen4_ple_recurrent_resize(seed);
+#ifndef _WIN32 // the PLE reader needs POSIX pread; on Windows --ple-io direct falls back to mmap
+            test_qwen4_ple_io_open(seed);
+            test_qwen4_ple_io_parity(seed);
+#endif
             test_qwen4_indexed_cache_admission(seed);
             test_qwen4_vbr_cuda(seed);
             test_qwen4_mtp_sidecar_contract(seed);

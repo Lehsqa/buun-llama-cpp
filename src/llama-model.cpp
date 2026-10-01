@@ -8,6 +8,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-ple-reader.h"
 #include "llama-sha256.h"
 
 #include "llama-kv-cache.h"
@@ -1415,6 +1416,9 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    if (ple_reader) {
+        LLAMA_LOG_INFO("%s: ple-reader: %s\n", __func__, ple_reader->stats_str().c_str());
+    }
     for (auto * lora : loras) {
         delete lora;
     }
@@ -1774,6 +1778,39 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     const auto kv = LLM_KV(arch);
 
     vocab.load(ml, kv);
+}
+
+static std::unique_ptr<llama_ple_reader> llama_open_ple_reader(
+        const llama_model_loader & ml, const ggml_tensor * t, const llama_model_params & params) {
+    if (t == nullptr) {
+        LLAMA_LOG_WARN("%s: --ple-io direct: the model has no PLE table, ignoring\n", __func__);
+        return nullptr;
+    }
+    if (!ml.lazy.has(t)) {
+        LLAMA_LOG_WARN("%s: --ple-io direct needs %s to be read lazily (-lzm on); using the mapping\n", __func__, ggml_get_name(t));
+        return nullptr;
+    }
+    const auto * w = ml.get_weight(ggml_get_name(t));
+    if (w == nullptr || w->idx >= ml.file_paths.size() || ml.file_paths[w->idx].empty()) {
+        LLAMA_LOG_WARN("%s: --ple-io direct: %s has no file path; using the mapping\n", __func__, ggml_get_name(t));
+        return nullptr;
+    }
+    llama_ple_reader_params rp;
+    rp.path       = ml.file_paths[w->idx];
+    rp.offset     = w->offs;
+    rp.n_rows     = (uint64_t) t->ne[1];
+    rp.row_size   = t->nb[1];
+    rp.n_threads  = params.ple_io_threads;
+    rp.cache_rows = params.ple_row_cache;
+    try {
+        auto r = std::make_unique<llama_ple_reader>(rp);
+        LLAMA_LOG_INFO("%s: PLE table %s read with %s positioned reads (%u threads, %u cached rows, %zu B rows)\n", __func__,
+                ggml_get_name(t), r->direct() ? "O_DIRECT" : "buffered", rp.n_threads, rp.cache_rows, rp.row_size);
+        return r;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_WARN("%s: --ple-io direct failed (%s); using the mapping\n", __func__, e.what());
+        return nullptr;
+    }
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
@@ -2322,6 +2359,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     ml.init_mappings(params.mmap_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr,
                      params.progress_callback, params.progress_callback_user_data);
+    if (params.ple_io == LLAMA_PLE_IO_DIRECT && !ml.no_alloc) {
+        ple_reader = llama_open_ple_reader(ml, per_layer_tok_embd, params);
+    }
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -3653,6 +3693,9 @@ llama_model_params llama_model_default_params() {
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.mmap_prefetch               =*/ LLAMA_MMAP_PREFETCH_MODE_AUTO,
         /*.repack_cache                =*/ nullptr,
+        /*.ple_io                      =*/ LLAMA_PLE_IO_MMAP,
+        /*.ple_io_threads              =*/ 16,
+        /*.ple_row_cache               =*/ 1u << 20,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

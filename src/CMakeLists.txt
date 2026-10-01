@@ -46,6 +46,7 @@ set(LLAMA_CORE_SOURCES
             llama-memory-recurrent.cpp
             llama-memory-tree.cpp
             llama-mmap.cpp
+            llama-ple-reader.cpp
             llama-repack-cache.cpp
             llama-model-loader.cpp
             llama-model-saver.cpp

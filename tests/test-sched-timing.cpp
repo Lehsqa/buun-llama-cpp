@@ -19,7 +19,11 @@ static void capture(ggml_log_level level, const char * text, void * user_data) {
 }
 
 int main() {
+#ifdef _WIN32
+    _putenv_s("GGML_SCHED_TIMING", "1");
+#else
     setenv("GGML_SCHED_TIMING", "1", 1);
+#endif
     ggml_backend_load_all();
     ggml_log_set(capture, nullptr);
 

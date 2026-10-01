@@ -2532,6 +2532,7 @@ struct llama_model_qwen4exp : public llama_model_base {
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+    void prefetch_inputs(const llama_token * tokens, int32_t n_tokens, int32_t n_skip) const override;
 };
 
 struct llama_model_qwen35moe : public llama_model_base {

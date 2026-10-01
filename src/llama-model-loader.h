@@ -143,6 +143,7 @@ struct llama_model_loader {
     } lazy;
 
     llama_files files;
+    std::vector<std::string> file_paths; // parallel to files; "" when the file has no path
     // nullopt denotes canonical bytes to be prepared after placement.
     std::map<ggml_tensor *, std::optional<llama_model_tensor_file_region>> source_regions;
     llama_ftype ftype;
