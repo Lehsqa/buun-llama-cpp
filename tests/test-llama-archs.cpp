@@ -21,6 +21,7 @@
 #include "../src/llama-model.h"
 #include "../src/llama-model-loader.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-ple-reader.h"
 #include "../src/llama-io.h"
 #include "../src/llama-vbr-artifact-adopt.h"
 #include "../src/llama-vbr-artifact-capture.h"
@@ -4337,6 +4338,56 @@ static void test_qwen4_ple_io_open(const size_t seed) {
     std::remove(path.c_str());
 }
 
+// mmap and direct PLE reads must give bit-identical logits: text in two equal ubatches (graph reuse), then an embd batch
+static std::vector<float> qwen4_ple_io_logits(const std::string & path, llama_ple_io io) {
+    llama_model_ptr model = qwen4_load_ple_io(path, LLAMA_LAZY_MODE_ON, io);
+    GGML_ASSERT((model->ple_reader != nullptr) == (io == LLAMA_PLE_IO_DIRECT));
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = 64; cp.n_batch = 16; cp.n_ubatch = 8; cp.n_threads = 2; cp.n_threads_batch = 2;
+    llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+    GGML_ASSERT(ctx != nullptr);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const int n_embd  = llama_model_n_embd(model.get());
+    std::vector<float> all;
+
+    llama_batch b = llama_batch_init(16, 0, 1);
+    for (int call = 0; call < 2; ++call) {
+        b.n_tokens = 8;
+        for (int i = 0; i < 8; ++i) {
+            b.token[i] = (call*8 + i*5 + 3) % n_vocab; b.pos[i] = call*8 + i; b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = 1;
+        }
+        GGML_ASSERT(llama_decode(ctx.get(), b) == 0);
+        const float * l = llama_get_logits(ctx.get());
+        all.insert(all.end(), l, l + 8*n_vocab);
+    }
+    llama_batch_free(b);
+
+    // IMROPE: an embd batch carries n_pos_per_embd (4) positions per token, laid out section-major
+    const int n_pos = 4;
+    llama_batch e = llama_batch_init(4*n_pos, n_embd, 1);
+    e.n_tokens = 4;
+    for (int i = 0; i < 4; ++i) {
+        for (int k = 0; k < n_embd; ++k) e.embd[i*n_embd + k] = 0.01f*float((i*7 + k*3) % 13 - 6);
+        for (int j = 0; j < n_pos; ++j) e.pos[j*4 + i] = 16 + i;
+        e.n_seq_id[i] = 1; e.seq_id[i][0] = 0; e.logits[i] = 1;
+    }
+    GGML_ASSERT(llama_decode(ctx.get(), e) == 0);
+    GGML_ASSERT(io == LLAMA_PLE_IO_MMAP || model->ple_reader->stats().rows > 0);
+    const float * l = llama_get_logits(ctx.get());
+    all.insert(all.end(), l, l + 4*n_vocab);
+    llama_batch_free(e);
+    return all;
+}
+
+static void test_qwen4_ple_io_parity(const size_t seed) {
+    const std::string path = qwen4_save_tmp_model(seed);
+    const auto a = qwen4_ple_io_logits(path, LLAMA_PLE_IO_MMAP);
+    const auto b = qwen4_ple_io_logits(path, LLAMA_PLE_IO_DIRECT);
+    GGML_ASSERT(a.size() == b.size());
+    GGML_ASSERT(memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0);
+    std::remove(path.c_str());
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -4414,6 +4465,7 @@ int main(int argc, char ** argv) {
         if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN4EXP) {
             test_qwen4_ple_recurrent_resize(seed);
             test_qwen4_ple_io_open(seed);
+            test_qwen4_ple_io_parity(seed);
             test_qwen4_indexed_cache_admission(seed);
             test_qwen4_vbr_cuda(seed);
             test_qwen4_mtp_sidecar_contract(seed);

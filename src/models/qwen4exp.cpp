@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-ple-reader.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1563,6 +1564,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
 //   mixed_n = (t[p]*m[0]) ^ ... ^ (t[p-n+1]*m[n-1]);  row = mixed_n % vocab[h] + offset[h]
 // The hash runs host-side because ggml has no int64 and no xor. EOS resets the window.
 
+// rows of one token: ctx[0] is the token, ctx[s] its s-th predecessor, already EOS-substituted
+static void qwen4exp_ple_rows(const llama_hparams & hp, const int64_t * ctx, int32_t * out) {
+    const int64_t per_gram = hp.ple_heads_per_ngram;
+    for (int64_t n = 2; n <= (int64_t) hp.ple_ngram_size; ++n) {
+        uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
+        for (int64_t j = 1; j < n; ++j) {
+            mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
+        }
+        const int64_t base = (n - 2) * per_gram;
+        for (int64_t g = 0; g < per_gram; ++g) {
+            const int64_t h_i = base + g;
+            out[h_i] = (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
+        }
+    }
+}
+
 class llm_graph_input_ple : public llm_graph_input_i {
 public:
     llm_graph_input_ple(const llama_model_qwen4exp & pmodel,
@@ -1573,10 +1590,13 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        return rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
+        const int64_t n = (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
+        return emb ? emb->ne[1] == n : rows->ne[0] == n;
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * emb = nullptr;    // F32 [ple_head_dim, ple_n_heads * n_tokens], set instead of rows when the reader is active
+    std::vector<float> emb_buf;     // scratch for the reader path
 
     const llama_model_qwen4exp & pmodel;
 
@@ -1603,7 +1623,6 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t n_gram   = hp.ple_ngram_size;
     const int64_t n_heads  = hp.ple_n_heads;
-    const int64_t per_gram = hp.ple_heads_per_ngram;
     const int64_t eos      = hp.ple_eos_token_id;
     const int64_t n_prev   = n_gram - 1;
 
@@ -1631,21 +1650,17 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             ctx[s] = cut ? eos : t;
         }
 
-        for (int64_t n = 2; n <= n_gram; ++n) {
-            uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
-            for (int64_t j = 1; j < n; ++j) {
-                mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
-            }
-            const int64_t base = (n - 2) * per_gram;
-            for (int64_t g = 0; g < per_gram; ++g) {
-                const int64_t h_i = base + g;
-                idx[i * n_heads + h_i] =
-                    (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
-            }
-        }
+        qwen4exp_ple_rows(hp, ctx.data(), idx.data() + i * n_heads);
     }
 
-    ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+    if (emb) {
+        const int64_t ne0 = pmodel.per_layer_tok_embd->ne[0];
+        emb_buf.resize((size_t) ne0 * idx.size());
+        pmodel.ple_reader->read_rows_f32(idx.data(), idx.size(), pmodel.per_layer_tok_embd->type, ne0, emb_buf.data());
+        ggml_backend_tensor_set(emb, emb_buf.data(), 0, emb_buf.size()*sizeof(float));
+    } else {
+        ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+    }
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.
@@ -1711,13 +1726,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
             static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
 
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-    ggml_set_input(ple_inp->rows);
-    ggml_tensor * rows = ple_inp->rows;
-    res->add_input(std::move(ple_inp));
+    ggml_tensor * emb = nullptr;
+    if (model.ple_reader) {
+        // rows come from the positioned-read reader already converted to f32, the same values ggml_get_rows yields
+        ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, model.per_layer_tok_embd->ne[0], n_heads * n_tokens);
+        ggml_set_input(ple_inp->emb);
+        emb = ple_inp->emb;
+        res->add_input(std::move(ple_inp));
+    } else {
+        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->rows);
+        ggml_tensor * rows = ple_inp->rows;
+        res->add_input(std::move(ple_inp));
 
-    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+        // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    }
     if (model.per_layer_tok_embd_scale) {
         emb = ggml_mul(ctx0, emb, model.per_layer_tok_embd_scale);
     }
