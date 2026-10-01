@@ -213,3 +213,170 @@ SSH commands time out at 120 s otherwise.
 PLE lazy (`-lm mmap -lzm on --mmap-prefetch off`, no mlock); output head on CUDA0; one server at a time;
 `HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0`; old launchers stay runnable as rollback;
 q4_0/q4_0 KV + default top_k as the reference config; ≥ ~500 MiB free on ROCm0 after load.
+
+---
+
+## 9. Strata port (opt/strata-port)
+
+### 9.1 P0 measurement
+
+Run 2026-10-01 13:11 → 13:53 (all nine arms in ~41 min) by `harness/p0_arms.sh`. Binary: `strata/p0-measure` at
+2539d2487 (adds the `GGML_SCHED_TIMING` summary, off unless the env is set) plus the uncommitted kit patches.
+Reference config as in §2: q4_0/q4_0 KV, ub1280, default top_k, MTP n=3, 21 CPU blocks, cache auto. `summ.py` medians of 5
+(pp: boot rep dropped). Raw files are `~/claude-opt/p0-*.{bench,log,io,fincore,greedy.json}`.
+
+**Reference arm (`p0-ref`)**, timing off:
+
+| arm | pp6k | pp32k | tg512f | accept | cache hits | pools |
+|---|---|---|---|---|---|---|
+| §2 branch, ub1280 | 340.5 | 305.2 | 36.5 | — | 64.0% | 3506 MiB |
+| **p0-ref** | **333.8** | **299.8** | **37.1** | 0.77 | 62.6% | 3506 MiB (iq4_nl 1485 / iq3_s 1291 / iq2_s 730) |
+
+pp6k and tg are within the per-rep spread of §2 (pp6k 313.7–338.9, tg 35.6–39.9, so per-rep tg noise is about ±2 t/s).
+pp32k −1.8% is not per-rep noise: its reps sit within ~1% of each other in a session (P1: 299.6–302.6), so this is a shift
+between sessions (§2 was measured on another day and binary). Pools are identical, so with timing off the timing build
+changes nothing.
+
+**I/O and residency (`p0-ref`, whole bench window, after load):** `majflt=60593` (system-wide `pgmajfault` delta) and
+`read_bytes=3.26 GiB` (server process). Per request, the first one reads 2191 MiB (cold touch). After that a pp6k reads
+3–77 MiB, a pp32k 7–108 MiB and a tg512f 19–319 MiB. Page-cache residency (`fincore.py`, taken before stop, caches not
+dropped between arms):
+
+| shard(s) | content | resident / size |
+|---|---|---|
+| 00001 | first shard | 0 / 661 MiB |
+| 00002 | `per_layer_token_embd.weight` (PLE table, lazy mmap) | **67.2 / 36 621 MiB (0.18%)** |
+| 00003–00006, 00022–00033 | CPU expert blocks 0–3, 31–47 (+ token_embd, blk 30 edges) | 22 238 / 26 776 MiB (83%) |
+| 00007–00021 | GPU-resident blocks | 0 / 26 088 MiB |
+| total | | 22 306 / 90 146 MiB |
+
+The PLE table is touched sparsely: lazy rows keep it at ~67 MiB of page cache. The CPU expert shards are almost fully
+cached and account for nearly all residency.
+
+**Prefill timing (`p0-timing`, `GGML_SCHED_TIMING=1`, one 32 008-token request).** It ran at 306.4 t/s, the same as p0-ref
+pp32k, so the per-split synchronisation costs no visible throughput. The log has 271 `sched-timing:` lines: 31 are prefill
+ubatches (84 splits, `wmib>0`), 215 are 2-split MTP-draft graphs and 25 are 46-split graphs (warmup + decode). Of the 215,
+121 run during prefill (8 after each of the 15 full 2048 batches, 1 near the last); the other 94 are decode-phase draft
+graphs (~4 per decode step).
+With b2048/ub1280, each batch is a 1280 + 768 ubatch pair. Medians (first ubatch excluded from the per-size rows):
+
+| ubatch | n | in_ms | ids_ms | wmib | cmp_ms CUDA0 | cmp_ms ROCm0 | cmp_ms CPU | sum ms | in_ms share¹ |
+|---|---|---|---|---|---|---|---|---|---|
+| 1280 | 15 | 796.4 | 13.0 | 11 700 | 206.6 | 2737.7 | 2.7 | 3745 | 21.4% |
+| 768 | 15 | 681.4 | 8.2 | 10 866 | 145.7 | 1874.1 | 1.6 | 2712 | 25.5% |
+| all prefill | 31 | 777.5 | 12.8 | 11 090 | 190.2 | 2216.6 | 2.6 | 3222 | **23.3%** |
+
+¹ The share column is the median of per-ubatch `in_ms / sum` ratios, not a ratio of the column medians. The column ratios
+are 21.3% (1280), 25.1% (768) and 24.1% (all).
+
+- `in_ms` is all input copies of a ubatch, including the expert-id readback (`ids_ms`, which is part of `in_ms`). It is
+  **~23–24% of a prefill ubatch** (21% at 1280, 25% at 768). Use ~24% (ratio of medians) to size P4.
+- `wmib` is the offloaded CPU-expert bytes uploaded to CUDA0: ~11 GiB per ubatch at ~15.7 GB/s effective. That figure is the
+  median over the 31 prefill ubatches of per-ubatch `wmib / in_ms` (MiB → 10⁹ B); the ratio of the column medians,
+  11 090 MiB / 777.5 ms, gives ~15.0 GB/s. Both include `ids_ms` and the small non-expert inputs. It is nearly the
+  same at 768 and 1280 tokens because almost every expert is hit either way, so the upload is a fixed per-ubatch cost.
+- ROCm0 compute dominates (69–73%) and grows with depth (2166 → 3404 ms at 1280 over the 32k prompt). CUDA0 compute is ~5.5%.
+- The timing path synchronises after every split, so these are serial sums. Any real copy/compute overlap is hidden
+  inside them.
+
+**Config items** (single arms, tg512f medians of 5; medians move about ±1 t/s between arms, per-rep tg about ±2 t/s):
+
+| item | tg512f | accept | other |
+|---|---|---|---|
+| reference (draft KV f16, p-min 0 = off, `-t 6`) | 37.1 | 0.77 | |
+| draft KV q8_0 (`-ctkd/-ctvd q8_0`) | 36.8 | 0.77 | draft KV 293.0 → 155.7 MiB; CUDA0 cache 3506 → **3645 MiB** (+139), hits 64.1%; pp6k 330.5, pp32k 300.8 |
+| `--draft-p-min 0.3` | 37.0 | 0.78 | |
+| `--draft-p-min 0.5` | 34.0 | 0.85 | |
+| `--draft-p-min 0.7` | 33.9 | 0.92 | |
+| `-t 6 -tb 6` | 37.5 | 0.77 | the launcher already defaults to `THREADS=6`, so this arm is a tg repeat of p0-ref (noise check), not a thread test |
+
+*Addendum, `-t` sweep measured in the P1 run* (`p1_arms.sh`, same build and config as `p1-mmap`, PLE via mmap; only
+`--threads/--threads-batch` change, the MTP draft keeps 6; the host has 12 hardware threads). The launcher default stays
+`THREADS=6`:
+
+| item | tg512f | accept | other |
+|---|---|---|---|
+| `-t 6` (`p1-mmap`, same session) | 36.4 | 0.74 | reps 34.9–39.9 |
+| `-t 5 -tb 5` (`p1-t5`) | 36.0 | 0.75 | reps 33.1–36.2; cache pools 3529 MiB |
+| `-t 12 -tb 12` (`p1-t12`) | **29.3** | 0.76 | reps 24.6–31.2; cache pools 3529 MiB |
+
+5 threads is level with 6. 12 threads (every SMT sibling of the 6-core 7600X) loses ~7 t/s; not profiled further.
+
+Draft KV q8_0 adds ~139 MiB of expert cache at equal tg and pp, a free memory win. Higher p-min raises acceptance but cuts
+the draft length more than it saves, so tg falls. Keep p-min off.
+
+**Determinism verdict: FAIL, `identical 2/5` with `MOE_CACHE=off`** (`p0-det-a` vs `p0-det-b`; the log confirms
+`MoE cache requested=off resolved=off`). `list` and `long` match. `code` diverges at char 257, `prose` at 467 and
+`math` at 429. Each is a plausible near-tie word choice after a long identical prefix. The expert cache is therefore not
+the only source of run-to-run variation on this host. The remaining source is not identified; MTP n=3 was on, so
+verify-batch shapes vary between runs. **Exactness gates fall back to quality + needles for this host.** Byte-identical
+greedy output cannot be required of a flag-off/flag-on pair.
+
+### 9.2 P1 PLE direct reader
+
+Run 2026-10-01 14:57 → 15:45 by `harness/p1_arms.sh` (seven arms, including the two `-t` arms in §9.1's addendum).
+Binary: `strata/p1-ple-direct` at d87edd0aa plus the uncommitted kit patches (6594ea436 later adds only Windows test
+guards and an O_DIRECT short-read guard; not rebuilt on the target). Reference config as in §2 / §9.1. `--ple-io direct`
+runs with the defaults: 16 reader threads, 1 048 576 cached rows (120 B rows). Raw files are
+`~/claude-opt/p1-*.{bench,log,io,fincore,greedy.json,quality.out,longctx.out}`. The log confirms the reader opened:
+`PLE table per_layer_token_embd.weight read with O_DIRECT positioned reads (16 threads, 1048576 cached rows, 120 B rows)`.
+The MTP draft model then logs `--ple-io direct: the model has no PLE table, ignoring`, as expected.
+
+**Bench (`summ.py` medians of 5, pp: boot rep dropped):**
+
+| arm | pp6k | pp32k | tg512f | accept | cache hits | pools |
+|---|---|---|---|---|---|---|
+| `p1-mmap` (`--ple-io mmap`, default) | 335.2 | 300.2 | 36.4 | 0.74 | 63.7% | 3506 MiB |
+| **`p1-direct`** (`--ple-io direct`) | **330.6** | **298.8** | **37.8** | 0.75 | 61.9% | 3506 MiB |
+| Δ direct − mmap | −1.4% | −0.5% | +3.8% | | | |
+
+Per-rep: mmap pp6k 322.1–341.0, tg 34.9–39.9; direct pp6k 317.4–334.4, tg 37.5–39.0. All three deltas are inside the
+per-rep spread. Direct is level with mmap: pp within −2%, tg not worse.
+
+**I/O and residency** (whole bench window after load; `majflt` is the system-wide `pgmajfault` delta, `read_bytes` the
+server process, which includes the O_DIRECT reads; caches were not dropped between arms):
+
+| arm | majflt | read_bytes | PLE shard 00002 | CPU expert shards (00003–00006, 00022–00033) | 00001 | GPU shards | total |
+|---|---|---|---|---|---|---|---|
+| `p1-mmap` | 74 079 | 5.64 GiB | 56.0 / 36 621 MiB | 22 270 / 26 776 MiB (83.2%) | 0 / 661 | 0 / 26 088 | 22 326 / 90 146 MiB |
+| `p1-direct` | 56 226 | 5.67 GiB | **0.0** / 36 621 MiB | 22 275 / 26 776 MiB (83.2%) | 0 / 661 | 0 / 26 088 | 22 275 / 90 146 MiB |
+| Δ | −17 853 (−24%) | +29.7 MiB (+0.5%) | −56 MiB | +5 MiB | | | |
+
+- Direct takes the PLE table out of the page cache entirely (0 MiB resident) and removes ~24% of the major faults
+  (−17.9k ≈ 70 MiB at 4 KiB), consistent with the PLE page touches of the mmap path.
+- `read_bytes` does not drop. The reader fetched 94 MiB through O_DIRECT, in the same range. Nearly all bytes read are
+  CPU-expert shard re-reads (26.8 GiB of shards against ~22.3 GiB cached on a 30 GiB host), and those are the same in
+  both arms.
+
+**Reader stats** (`p1-direct`, the line printed at model teardown, covering the whole run):
+`ple-reader: direct rows=3072688 hit=99.2% reads=23440 MiB=94.0 p50=126us p99=8402us blocked_ms=1132.2`.
+The last periodic line before teardown shows hit 99.3%. 99.2% of row lookups hit the 1M-row cache. The 23 440 disk
+reads have a 126 µs median and an 8.4 ms p99. The compute thread waited 1.13 s in total over the ~11 min bench arm (5 reps
+each of pp6k, pp32k and tg512f). `p1-direct-quality` gives the same picture: hit 99.0%, p50 110 µs, p99 8.3 ms, blocked
+0.69 s. Short greedy prompts start cold (`p1-det-direct` ends at hit 59.3%).
+
+**Quality (`p1-direct-quality`, `--ple-io direct`):** `quality.py` **10/10**. Long context: `longctx.py` 142 266 tokens, pp
+185.0 / tg 23.2 (§2 mmap: 187.4 / 23.7), needles **3/3** (PASS-A, PASS-B, PASS-C found). Same result as §2's gates.
+
+**Greedy (information only, `MOE_CACHE=off`, both logs show `requested=off resolved=off`):** `p1-det-mmap` vs
+`p1-det-direct` gives `identical 3/5`. All ten outputs are non-empty (code 502/534, prose 844/843, list 39/39, math
+511/511, long 191/191 chars). `list`, `math` and `long` match. `code` diverges at char 248 and `prose` at 467, the same
+kind of near-tie split as the 2/5 between two flag-off runs in §9.1.
+
+**Gate:**
+1. `identical 5/5`: **skipped**, per the plan's own clause. §9.1 found only 2/5 between two flag-off runs, so byte
+   identity cannot separate the flag from run-to-run variation. Observed 3/5 (information only, above).
+2. Throughput vs `p1-mmap` within noise (pp −2%, tg −5%): **PASS**. pp6k −1.4%, pp32k −0.5%, tg512f +3.8%.
+3. Quality 10/10 and needles 3/3: **PASS**.
+4. `ple-reader:` line shows `direct` (O_DIRECT active on the NVMe, no buffered fallback): **PASS**.
+
+**Verdict: PASS.** `--ple-io direct` is throughput-neutral: pp −0.5…−1.4%, inside the gate; tg +3.8%, inside per-rep
+noise. It keeps the 36.6 GiB PLE table out of the page cache and cuts major faults by ~24%. Quality and needles match
+§2; the greedy differences are within the host's existing run-to-run variation. Flag to promote: **`--ple-io direct`**
+(with the defaults `--ple-io-threads 16 --ple-row-cache 1048576`). The user decides whether the main launcher takes it.
+In the code `--ple-io` stays `mmap` by default (new flags default off).
+
+New launcher `~/Scripts/llama.cpp/RTX+MI_Qwen3.8-Flash-Next_opt.sh` (repo: `scripts/rtx-mi50/RTX+MI_Qwen3.8-Flash-Next_opt.sh`)
+already uses it: `PLE_IO=direct` is its default, and `SCHED_TIMING=N` is a diagnostic knob that exports
+`GGML_SCHED_TIMING=N` (default 0 = off). Rollback: `PLE_IO=mmap` with the same launcher, or the main
+`RTX+MI_Qwen3.8-Flash-Next.sh`.
