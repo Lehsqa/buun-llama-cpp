@@ -17,9 +17,9 @@ file records what was done on top of it, how it was measured, and what to do nex
 | Target source clone | `~/Projects/buun-opt-src` (tracks `fork/opt/rtx-mi50`; has kit patches 0001/0003/0004/0005 applied as uncommitted changes — expected, do not commit them). |
 | Target build root | `~/Projects/buun-opt-rtx-mi50/{cuda,hip,runtime}`. `runtime/` = merged CUDA bin + HIP `libggml-hip.so`. |
 | Production runtime (untouched) | `~/Projects/buun-rtx-mi-ed774445cd69-cuda/runtime` |
-| New launcher | `~/Scripts/llama.cpp/RTX+MI_Qwen3.8-Flash-Next_opt.sh` (log `~/.local/state/llama-launcher/llama-server-qwen38next-buun-opt.log`, pid file `llama-server-buun-opt-10000.pid`). |
-| Old launchers (untouched) | `RTX+MI_Qwen3.8-Flash-Next.sh` (buun prod, defaults turbo4 + top_k 4096 override!), `_old.sh` (pre-buun llama.cpp rollback). |
-| systemd | `~/.config/systemd/user/qwen-flash-llama.service` still points at the OLD launcher; not changed. |
+| **Deployed launcher (user promoted it, verified 2026-10-01)** | `~/Scripts/llama.cpp/RTX+MI_Qwen3.8-Flash-Next.sh` = the generated opt launcher (BUUN_ROOT `buun-opt-rtx-mi50`, ub1280, `TOPK_OVERRIDE` empty, log `llama-server-qwen38next-buun-opt.log`, pid file `llama-server-buun-opt-10000.pid`). The **only user edit**: `KV_K/KV_V` defaults changed back to **turbo4**. turbo4 at ub1280 is NOT benchmarked or quality-checked (all §2 numbers are q4_0). `_opt.sh` no longer exists. |
+| Rollback launchers | `RTX+MI_Qwen3.8-Flash-Next_old.sh` = the former buun production launcher (production runtime, ub768, turbo4, hardcoded `top_k=4096`). `_buun_old.sh` = an older buun launcher (2026-09-20). No launcher runs the pre-buun llama.cpp `2857e5114` binary any more; only the comments mention it. |
+| systemd | `~/.config/systemd/user/qwen-flash-llama.service`: `ExecStart=%h/Scripts/llama.cpp/RTX+MI_Qwen3.8-Flash-Next.sh`, so it now **starts the opt runtime**. Currently inactive. |
 | Remote harness | `~/claude-opt/` on target (see §5). |
 
 ### Rebuild on target after pushing new commits
@@ -147,8 +147,10 @@ SSH commands time out at 120 s otherwise.
   "listening", snapshots VRAM (`NAME.vram`), optional single request / `BENCH_ARGS` (→ `NAME.bench`) /
   `QUALITY=1` (→ `NAME.quality.*`, `NAME.longctx.*`), then TERM → SIGKILL.
 - `summ.py` — summarises `.bench` + log (pools, hits).
-- `gen_opt_launcher.py` — regenerates `~/Scripts/llama.cpp/RTX+MI_Qwen3.8-Flash-Next_opt.sh` from the
-  deployed launcher (header + defaults: BUUN_ROOT opt runtime, q4_0 KV, ub1280, TOPK_OVERRIDE, own log/pid).
+- `gen_opt_launcher.py` — generated the opt launcher from the old buun launcher (header + defaults:
+  BUUN_ROOT opt runtime, q4_0 KV, ub1280, TOPK_OVERRIDE, own log/pid). Its `src`/`dst` paths are stale now
+  (source became `_old.sh`; the output was promoted to the main name). Edit the paths before reusing it,
+  and don't overwrite the user's turbo4 edit.
 - `dmon_arm.sh` — 24k prefill while sampling `nvidia-smi dmon` + `top`.
 - Result files kept: `prod-ub768-bench`, `opt2-ub{768,1024,1280}-bench` (before MTP cap),
   `opt3-ub{768,1024,1280,1536}-bench`, `opt3-ub1280-quality`, `sched0.txt/sched1.txt` (split dumps).
@@ -194,7 +196,10 @@ SSH commands time out at 120 s otherwise.
    (`MOE_CACHE_PROFILE=1`, never measured), `--moe-cache-cpu-overlap` sweep at the new budget.
 5. **Wave64 portability**: stable top-k still uses a 32-bit ballot mask assumption; f16/f32 `MUL_MAT_ID`
    page fault on ROCm0 (HANDOFF §4.10) — both off-path for this model.
-6. **turbo4 KV / top_k 4096** remain unmeasured at long context (`KV_K=turbo4 KV_V=turbo4`, `TOPK_OVERRIDE=4096`).
+6. **turbo4 KV at ub1280 is now the deployed default (user choice) but unmeasured.** First thing to run:
+   bench + QUALITY arms with `KV_K=turbo4 KV_V=turbo4` against the q4_0 ub1280 numbers in §2. turbo4
+   uses fused FA decode and changes ROCm0/CUDA0 KV size (4.125 vs 4.5 bpv), so recheck free VRAM after load.
+   `TOPK_OVERRIDE=4096` is also still unmeasured.
 7. Image (M-RoPE) prompts fall back to per-cell graph (bigger, reallocated at runtime). Making block select
    work for the ranked layout would remove `LLAMA_QSA_BLOCK_TOPK=0` advice.
 8. Port these commits to current master (21 commits ahead of the pin) if production moves off the pin;
