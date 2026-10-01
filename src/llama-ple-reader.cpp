@@ -139,6 +139,8 @@ struct llama_ple_reader::impl {
             }
             if (r == 0) break; // end of file: the rows must still be covered, checked below
             got += (uint64_t) r;
+            // O_DIRECT short read: a follow-up pread would start at an unaligned offset; treat it as EOF
+            if (is_direct && got < job.len) break;
         }
         record_latency((uint64_t) (ple_now_us() - t0));
         n_reads++;

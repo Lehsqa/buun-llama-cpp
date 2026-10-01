@@ -3739,7 +3739,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--ple-io"}, "MODE",
         "how lazily read PLE (per-layer n-gram embedding) rows are fetched (default: mmap)\n"
         "- mmap: through the file mapping (page faults, page cache)\n"
-        "- direct: positioned reads that bypass the page cache, with a row cache (needs -lzm on)",
+        "- direct: positioned reads that bypass the page cache, with a row cache (needs a lazily read table (-lzm on/auto))",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "mmap")   { params.ple_io = LLAMA_PLE_IO_MMAP;   }
             else if (value == "direct") { params.ple_io = LLAMA_PLE_IO_DIRECT; }

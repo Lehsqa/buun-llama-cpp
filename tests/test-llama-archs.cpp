@@ -4507,8 +4507,10 @@ int main(int argc, char ** argv) {
         }
         if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN4EXP) {
             test_qwen4_ple_recurrent_resize(seed);
+#ifndef _WIN32 // the PLE reader needs POSIX pread; on Windows --ple-io direct falls back to mmap
             test_qwen4_ple_io_open(seed);
             test_qwen4_ple_io_parity(seed);
+#endif
             test_qwen4_indexed_cache_admission(seed);
             test_qwen4_vbr_cuda(seed);
             test_qwen4_mtp_sidecar_contract(seed);
