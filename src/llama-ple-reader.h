@@ -18,6 +18,7 @@ struct llama_ple_reader_params {
     uint32_t    n_threads  = 16;
     uint32_t    cache_rows = 1u << 20; // 0 = no row cache
     bool        direct     = true;     // try O_DIRECT, fall back to buffered pread
+    bool        test_fail_direct_probe = false; // tests: treat the O_DIRECT probe as refused
 };
 
 struct llama_ple_reader_stats {

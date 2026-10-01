@@ -223,6 +223,20 @@ llama_ple_reader::llama_ple_reader(const llama_ple_reader_params & params) : pim
     if (params.direct) {
         d.fd = open(params.path.c_str(), O_RDONLY | O_DIRECT);
         d.is_direct = d.fd >= 0;
+        if (d.is_direct) {
+            // some filesystems (FUSE, network, >4 KiB logical blocks) accept O_DIRECT at open and fail the read:
+            // probe one aligned page; any error (a short read at EOF is fine) means use buffered reads instead
+            ple_buf probe(PLE_ALIGN);
+            ssize_t r;
+            do {
+                r = pread(d.fd, probe.p, PLE_ALIGN, (off_t) (params.offset / PLE_ALIGN * PLE_ALIGN));
+            } while (r < 0 && errno == EINTR);
+            if (r < 0 || params.test_fail_direct_probe) {
+                close(d.fd);
+                d.fd = -1;
+                d.is_direct = false;
+            }
+        }
     }
 #endif
     if (d.fd < 0) {

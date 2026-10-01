@@ -36,11 +36,15 @@ static int check_rows(llama_ple_reader & r, const std::vector<uint8_t> & all, co
     return 0;
 }
 
-static int run_case(const fs::path & p, const std::vector<uint8_t> & all, bool direct, uint32_t threads, uint32_t cache) {
+static int run_case(const fs::path & p, const std::vector<uint8_t> & all, bool direct, uint32_t threads, uint32_t cache,
+                    bool fail_probe = false) {
     llama_ple_reader_params rp;
     rp.path = p.string(); rp.offset = HEAD; rp.n_rows = NROW; rp.row_size = ROW;
     rp.n_threads = threads; rp.cache_rows = cache; rp.direct = direct;
+    rp.test_fail_direct_probe = fail_probe;
     llama_ple_reader r(rp);
+    // a refused O_DIRECT probe must fall back to buffered reads (the bytes are checked below)
+    if (fail_probe) REQUIRE(!r.direct());
 
     std::mt19937 gen(7);
     std::vector<int32_t> rows(20000);
@@ -69,7 +73,8 @@ static int run_case(const fs::path & p, const std::vector<uint8_t> & all, bool d
     bool threw = false;
     try { r.read_rows(&bad, 1, tmp); } catch (const std::runtime_error &) { threw = true; }
     REQUIRE(threw);
-    printf("case direct=%d(%d) threads=%u cache=%u: %s\n", direct, r.direct(), threads, cache, r.stats_str().c_str());
+    printf("case direct=%d(%d)%s threads=%u cache=%u: %s\n", direct, r.direct(), fail_probe ? " probe-refused" : "", threads, cache,
+            r.stats_str().c_str());
     return 0;
 }
 
@@ -121,6 +126,7 @@ int main() {
         if (run_case(p, all, true,  16, 1u << 16)) return 1;
         if (run_case(p, all, true,  1,  0))        return 1;
         if (run_case(p, all, false, 4,  64))       return 1;
+        if (run_case(p, all, true,  4,  1u << 16, true)) return 1;
         fs::remove(p);
     }
     bool threw = false;
