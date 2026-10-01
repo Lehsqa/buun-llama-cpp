@@ -842,6 +842,11 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
+    // advisory: the model may start reading inputs for tokens[n_skip, n_tokens) ahead of their ubatches; never changes results
+    virtual void prefetch_inputs(const llama_token * tokens, int32_t n_tokens, int32_t n_skip) const {
+        GGML_UNUSED(tokens); GGML_UNUSED(n_tokens); GGML_UNUSED(n_skip);
+    }
+
 protected:
     llama_model_params params;
 

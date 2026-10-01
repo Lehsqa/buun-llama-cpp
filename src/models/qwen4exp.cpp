@@ -1580,6 +1580,32 @@ static void qwen4exp_ple_rows(const llama_hparams & hp, const int64_t * ctx, int
     }
 }
 
+// Warm the PLE row cache for the batch's later ubatches. Windows reaching before the batch are skipped: their
+// predecessors live in the KV cells, which set_input() reads authoritatively anyway.
+void llama_model_qwen4exp::prefetch_inputs(const llama_token * tokens, int32_t n_tokens, int32_t n_skip) const {
+    if (!ple_reader || tokens == nullptr || hparams.ple_n_heads == 0) {
+        return;
+    }
+    const int64_t n_gram = hparams.ple_ngram_size;
+    const int64_t eos    = hparams.ple_eos_token_id;
+    std::vector<int32_t> rows;
+    rows.reserve((size_t) std::max(0, n_tokens - n_skip) * hparams.ple_n_heads);
+    std::vector<int64_t> ctx(n_gram);
+    std::vector<int32_t> one(hparams.ple_n_heads);
+    for (int64_t i = std::max<int64_t>(n_skip, n_gram - 1); i < n_tokens; ++i) {
+        ctx[0] = tokens[i];
+        bool cut = false;
+        for (int64_t s = 1; s < n_gram; ++s) {
+            const llama_token t = cut ? LLAMA_TOKEN_NULL : tokens[i - s];
+            cut = cut || t < 0 || t == eos;
+            ctx[s] = cut ? eos : t;
+        }
+        qwen4exp_ple_rows(hparams, ctx.data(), one.data());
+        rows.insert(rows.end(), one.begin(), one.end());
+    }
+    ple_reader->prefetch(rows.data(), rows.size());
+}
+
 class llm_graph_input_ple : public llm_graph_input_i {
 public:
     llm_graph_input_ple(const llama_model_qwen4exp & pmodel,

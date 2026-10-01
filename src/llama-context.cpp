@@ -4740,6 +4740,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // otherwise leave only the last ubatch's hiddens in layer_hiddens).
     dflash_reset_hidden_capture();
 
+    // let the model read inputs of the later ubatches while the first one computes
+    if (batch_inp.token && !batch_inp.embd && batch_inp.n_tokens > (int32_t) cparams.n_ubatch) {
+        model.prefetch_inputs(batch_inp.token, batch_inp.n_tokens, (int32_t) cparams.n_ubatch);
+    }
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
