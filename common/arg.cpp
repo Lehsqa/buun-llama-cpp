@@ -3736,6 +3736,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LAZY_MODE"));
     add_opt(common_arg(
+        {"--ple-io"}, "MODE",
+        "how lazily read PLE (per-layer n-gram embedding) rows are fetched (default: mmap)\n"
+        "- mmap: through the file mapping (page faults, page cache)\n"
+        "- direct: positioned reads that bypass the page cache, with a row cache (needs -lzm on)",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "mmap")   { params.ple_io = LLAMA_PLE_IO_MMAP;   }
+            else if (value == "direct") { params.ple_io = LLAMA_PLE_IO_DIRECT; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_PLE_IO"));
+    add_opt(common_arg(
+        {"--ple-io-threads"}, "N",
+        string_format("reader threads for --ple-io direct (default: %u)", params.ple_io_threads),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 256) { throw std::invalid_argument("out of range [1, 256]"); }
+            params.ple_io_threads = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_PLE_IO_THREADS"));
+    add_opt(common_arg(
+        {"--ple-row-cache"}, "N",
+        string_format("rows cached by --ple-io direct, 0 = none (default: %u)", params.ple_row_cache),
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("must be >= 0"); }
+            params.ple_row_cache = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_PLE_ROW_CACHE"));
+    add_opt(common_arg(
         {"--mmap-prefetch"}, "MODE",
         "bulk mmap prefetch policy (default: auto)\n"
         "- auto: prefetch only when the mapped model comfortably fits available system RAM\n"

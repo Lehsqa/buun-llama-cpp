@@ -952,6 +952,7 @@ llama_model_loader::llama_model_loader(
         resolve_model_architecture(*this);
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_paths.emplace_back(fname);
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -1020,6 +1021,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                file_paths.emplace_back(fname_split);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -1063,6 +1065,7 @@ llama_model_loader::llama_model_loader(
         resolve_model_architecture(*this);
 
         files.emplace_back(new llama_file(file));
+        file_paths.emplace_back();
         contexts.emplace_back(ctx);
 
         // Save tensors data offset info of the main file.
@@ -2099,12 +2102,14 @@ void llama_model_loader::init_mappings(
                     throw std::runtime_error("model load cancelled during weight preparation");
                 }
             }));
+            file_paths.emplace_back(); // prepared files are temp/cache files without a stable path
         } else {
             auto it = source_files.find(region->path);
             if (it == source_files.end()) {
                 if (files.size() > UINT16_MAX) throw std::runtime_error("too many mapped model files");
                 const uint16_t next = uint16_t(files.size());
                 files.emplace_back(new llama_file(region->path.c_str(), "rb"));
+                file_paths.emplace_back(region->path);
                 it = source_files.emplace(region->path, next).first;
             }
             idx = it->second;

@@ -4298,6 +4298,45 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
     return all_ok ? 0 : 1;
 }
 
+// --ple-io direct: the reader opens only for a lazily read table on a real load, and falls back otherwise
+static std::string qwen4_save_tmp_model(const size_t seed) {
+    gguf_context_ptr gguf = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    llama_model_params mp = llama_model_default_params();
+    mp.progress_callback = silent_model_load_progress;
+    ggml_backend_dev_t cpu_devices[] = { nullptr };
+    mp.devices = cpu_devices;
+    size_t tmp = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf.get(), set_tensor_data, &tmp, mp));
+    GGML_ASSERT(model != nullptr);
+    GGML_ASSERT(model->per_layer_tok_embd != nullptr);
+    const std::string path = "test-qwen4-ple-io.gguf";
+    llama_model_save_to_file(model.get(), path.c_str());
+    return path;
+}
+
+static llama_model_ptr qwen4_load_ple_io(const std::string & path, llama_lazy_mode lazy, llama_ple_io io) {
+    llama_model_params mp = llama_model_default_params();
+    mp.progress_callback = silent_model_load_progress;
+    ggml_backend_dev_t cpu_devices[] = { nullptr };
+    mp.devices = cpu_devices;
+    mp.lazy_mode = lazy;
+    mp.ple_io = io;
+    mp.ple_io_threads = 4;
+    mp.ple_row_cache = 4096;
+    llama_model_ptr model(llama_model_load_from_file(path.c_str(), mp));
+    GGML_ASSERT(model != nullptr);
+    return model;
+}
+
+static void test_qwen4_ple_io_open(const size_t seed) {
+    const std::string path = qwen4_save_tmp_model(seed);
+    GGML_ASSERT(qwen4_load_ple_io(path, LLAMA_LAZY_MODE_ON,  LLAMA_PLE_IO_DIRECT)->ple_reader != nullptr);
+    GGML_ASSERT(qwen4_load_ple_io(path, LLAMA_LAZY_MODE_ON,  LLAMA_PLE_IO_MMAP)->ple_reader   == nullptr);
+    // not lazily read -> warning + mmap path, never a failed load
+    GGML_ASSERT(qwen4_load_ple_io(path, LLAMA_LAZY_MODE_OFF, LLAMA_PLE_IO_DIRECT)->ple_reader == nullptr);
+    std::remove(path.c_str());
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -4374,6 +4413,7 @@ int main(int argc, char ** argv) {
         }
         if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN4EXP) {
             test_qwen4_ple_recurrent_resize(seed);
+            test_qwen4_ple_io_open(seed);
             test_qwen4_indexed_cache_admission(seed);
             test_qwen4_vbr_cuda(seed);
             test_qwen4_mtp_sidecar_contract(seed);

@@ -627,6 +627,9 @@ struct common_params {
 
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
     enum llama_mmap_prefetch_mode mmap_prefetch = LLAMA_MMAP_PREFETCH_MODE_AUTO;
+    enum llama_ple_io ple_io = LLAMA_PLE_IO_MMAP; // how lazily read PLE rows are fetched
+    uint32_t ple_io_threads  = 16;
+    uint32_t ple_row_cache   = 1u << 20;
     std::string repack_cache; // retain prepared host safetensors only when explicitly requested
 
     common_cpu_params cpuparams;

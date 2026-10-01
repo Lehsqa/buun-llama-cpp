@@ -645,6 +645,8 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+class llama_ple_reader;
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -704,6 +706,9 @@ struct llama_model {
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
     struct ggml_tensor * per_layer_tok_embd_scale = nullptr;
     struct ggml_tensor * per_layer_tok_embd_bias  = nullptr;   // EXL3 n-gram tables: per-head bias [head_dim, n_heads]
+
+    // set when the PLE table is read with LLAMA_PLE_IO_DIRECT (see llama-ple-reader.h); null on the mmap path
+    std::unique_ptr<llama_ple_reader> ple_reader;
 
     struct ggml_tensor * hc_head_norm = nullptr;
     struct ggml_tensor * hc_head_down = nullptr;
