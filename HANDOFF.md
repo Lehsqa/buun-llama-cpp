@@ -32,7 +32,7 @@ Toolchains (unchanged from the working production setup — do not replace them)
   - Tensor types: f32 388, f16 1, q5_1 1, q8_0 666, **iq4_nl 48, iq3_s 24, iq2_s 72**, bf16 24.
     **Expert tensors are iq2_s / iq3_s / iq4_nl only — no q4_K, no f16/f32 experts.**
 - **Draft**: `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (2.79 GB; q8_0 19, f32 11, bf16 2). Shared-tensor MTP that **borrows** the target's `token_embd`/`output`. A Q4_K_M full-module sidecar also exists as a fallback.
-- **Deployed config**: ctx 150 000, ubatch 768, batch 2048, target KV q4_0/q4_0, draft KV f16/f16, MTP n_max 3, split `3,32`, output+draft on CUDA0, 21 CPU expert blocks `0|1|2|3|31..47`, cache auto, PLE lazy.
+- **Deployed config** (2026-09-24 state; **superseded by §9** — the deployed launcher now runs the `opt` runtime at ubatch 1280): ctx 150 000, ubatch 768, batch 2048, target KV q4_0/q4_0, draft KV f16/f16, MTP n_max 3, split `3,32`, output+draft on CUDA0, 21 CPU expert blocks `0|1|2|3|31..47`, cache auto, PLE lazy.
 
 ## 3. Building both backends (mixed-vendor recipe)
 
@@ -79,9 +79,14 @@ CACHE_PROVIDER=hip  BUILD_JOBS=6 bash build-linux.sh    # applies patch 0002, se
 9. **Server shutdown can wedge**: `signal_handler` calls a non-async-signal-safe `shutdown_handler`; after a first signal the process can end up with INT/TERM **blocked forever** (`SigBlk 0x4002`) and only `SIGKILL` ends it (it keeps its VRAM). The launcher starts it with `setsid` and escalates TERM→SIGKILL (`STOP_GRACE=15`, immune to a second Ctrl+C).
 10. **Off-path HIP defects** (do not report "HIP passes"): `MUL_MAT_ID` with **f16/f32** weights page-faults ROCm0 (reproduces in a HIP-only build); the **stable/ties TOP_K** kernel assumes 32-lane warps (32-bit ballot mask + `<<<WARP_SIZE>>>` with `base += warpSize`) and is wrong on wave64. This model dispatches neither (no f16/f32 experts; `ggml_top_k(..., stable=false)`).
 11. **One server at a time** at 150k — both GPUs are nearly full (CUDA0 ~400–800 MiB, ROCm0 ~600–800 MiB free).
-12. Measurement noise: first request after boot is ~30 % slower; tg varies ±5 %; use medians of ≥5 reps for tg and exclude the boot sample for pp.
+12. Measurement noise: first request after boot is ~30 % slower; tg varies ±5 %; use medians of ≥5 reps for tg and exclude the boot sample for pp. P0 refined this: per-rep tg spread is about ±2 t/s, and pp32k can shift ~2 % between sessions on different days, so only same-session A/B deltas beyond that are real.
+13. **Greedy output is not reproducible run to run** (P0: only 2/5 prompts identical between two flag-off runs with `MOE_CACHE=off`; the source is unidentified, MTP verify-batch shapes are the suspect). Byte-identical output cannot gate a flag. Gate on `quality.py` 10/10 + `longctx.py` needles 3/3 + throughput within noise, and read greedy diffs as information only.
 
-## 5. Measured baseline (judge any change against this)
+## 5. Measured baselines
+
+Judge a change against the **newest** table (§5.2, ub1280, same-session A/B). §5.1 is the original pin baseline at ubatch 768, kept for history.
+
+### 5.1 Pin baseline (2026-09-24, ub768)
 
 | arm | pp6k | pp32k | tg512f | notes |
 |---|---|---|---|---|
@@ -93,6 +98,41 @@ CACHE_PROVIDER=hip  BUILD_JOBS=6 bash build-linux.sh    # applies patch 0002, se
 Cache session detail: pools `iq4_nl 907 + iq3_s 785 + iq2_s 447 = 2139 MiB`, 3097 slots, hits **47–52 %**, 0 dispatch/collect failures, ~143 k evictions/session. Long context: 142 321-token request OK (pp 164.9, tg 20.8), needles at 10/50/90 % all retrieved; TTFT recovers to 0.72–1.34 s after a 129 s prefill.
 
 Tuning already done (detail in the report): ub 512/640/768 trade cache capacity for prefill (ub640 = +8.3 % tg / −8.7 % pp32k; ub768 wins 32k-prompt total latency); CPU overlap `auto` ≈ `0`; 20 blocks + numeric 512/768 MiB cap = +5 %/+6 % over its own no-repack control but far below the 21-block auto arm; turbo4 KV (4.125 bpv vs q4_0's 4.5) measured **neutral** at 8k/32k — its 140k arms were stopped before running.
+
+### 5.2 `opt/rtx-mi50` and Strata P0/P1 (2026-09-25 … 2026-10-01)
+
+150k ctx, q4_0/q4_0 KV, default `top_k`, MTP n=3, 21 CPU blocks, cache auto. `bench.py` medians of 5 (pp: boot rep dropped). Sources: `scripts/rtx-mi50/REPORT.md` §2 and §9.
+
+| arm | ub | pp6k | pp32k | tg512f | cache hits | pools | gates |
+|---|---|---|---|---|---|---|---|
+| production runtime (pin) | 768 | 285.9 | 259.5 | 34.4 | 49.9 % | 2020 MiB | |
+| `opt/rtx-mi50` | 768 | 279.5 | 255.5 | 36.9 | 64.9 % | 3904 MiB | |
+| `opt/rtx-mi50` | 1024 | 332.1 | 302.3 | 35.7 | 63.8 % | 3734 MiB | |
+| **`opt/rtx-mi50` (deployed default)** | **1280** | **340.5** | **305.2** | **36.5** | 64.0 % | 3506 MiB | quality 10/10; 142 266-token needles 3/3 (pp 187.4 / tg 23.7) |
+| `opt/rtx-mi50` | 1536 | 335.3 | 304.7 | 37.6 | 61.2 % | 3323 MiB | |
+| P0 reference re-run (`p0-ref`) | 1280 | 333.8 | 299.8 | 37.1 | 62.6 % | 3506 MiB | |
+| P1 `--ple-io mmap` (`p1-mmap`) | 1280 | 335.2 | 300.2 | 36.4 | 63.7 % | 3506 MiB | |
+| **P1 `--ple-io direct`** (`p1-direct`) | 1280 | 330.6 | 298.8 | 37.8 | 61.9 % | 3506 MiB | quality 10/10; needles 3/3 (pp 185.0 / tg 23.2) |
+
+- `opt/rtx-mi50` at ub1280 vs same-day production: **+19 % pp6k, +18 % pp32k, +6 % tg**. Long context: pp 187.4 vs 164.9, tg 23.7 vs 20.8 (HANDOFF §5.1 baseline).
+- The gain comes from memory, not kernels: the compute buffers at ub768 fell CUDA0 1754 → 944 MiB and ROCm0 1649 → 1014 MiB (block-ranked QSA selection `e4662b5d4` plus one shared KQ-mask view across QSA layers `5542623ce`; per-layer mask views had made the scheduler copy the 219 MiB mask to ROCm0 8×), and the MTP draft context on CUDA0 fell 1493 → 498 MiB (draft ubatch capped at 256, `3ab2be1c6`). That freed VRAM became expert cache (pools 2020 → 3506 MiB at ub1280, hits ~50 % → 62–65 %) and allowed a larger ubatch.
+- Rows are not all one session: the ub768–1536 rows come from 2026-09-25, the P0/P1 rows from 2026-10-01. The ub1280 rows differ by up to ~2 % on pp32k; REPORT §9.1 attributes that to a shift between sessions (reps within a session sit within ~1 %), so compare within one session only (§4.12).
+
+### 5.3 Strata P0 — where the time goes (`GGML_SCHED_TIMING`, one 32 008-token prefill)
+
+- **Prefill ubatch input copies are 23–24 % of the ubatch** (777.5 ms of a 3222 ms median; 21 % at ub1280, 25 % at ub768). About **11 GiB of offloaded CPU-expert weights** is uploaded to CUDA0 per ubatch at ~15 GB/s effective, nearly independent of ubatch size because almost every expert is hit either way. This sizes P4.
+- ROCm0 compute is **69–73 %** of prefill compute and grows with depth (2166 → 3404 ms at ub1280 over the 32k prompt); CUDA0 compute is ~5.5 %, CPU ~0. The timing path syncs after every split, so these are serial sums and any real copy/compute overlap is hidden. The timing itself costs no visible throughput (306.4 vs 299.8 t/s).
+- Page cache after the bench: the lazy PLE table keeps only ~67 of 36 621 MiB resident (0.18 %); the CPU expert shards are 83 % resident (22.2 of 26.8 GiB) on the 30 GiB host. The first request reads 2191 MiB cold; later requests read single- to low-hundreds of MiB.
+- Config items (tg512f medians of 5, ±1 t/s between arms): draft KV q8_0 is neutral on tg/pp and frees **+139 MiB of expert cache** (3506 → 3645 MiB), a free memory win that the launchers do not take yet (`DRAFT_KV_K/V` still default `f16`). `--draft-p-min 0.3` is neutral; 0.5 and 0.7 raise acceptance (0.85 / 0.92) but cut tg to 34.0 / 33.9, so keep p-min off. `-t 5` ≈ `-t 6` (36.0 vs 36.4); **`-t 12` loses ~7 t/s (29.3)** and was not profiled further. Keep `THREADS=6`.
+- Determinism: see §4.13.
+
+### 5.4 Strata P1 — `--ple-io direct` (verdict PASS)
+
+- vs `--ple-io mmap`: pp6k −1.4 %, pp32k −0.5 %, tg +3.8 % — all inside the per-rep spread (gate: pp −2 %, tg −5 %).
+- PLE page-cache residency 56 → **0 MiB**; major faults 74 079 → 56 226 (**−24 %**); `read_bytes` unchanged (5.64 vs 5.67 GiB, dominated by CPU-expert shard re-reads).
+- Reader: row-cache hit 99.2 %, 23 440 disk reads, p50 126 µs, p99 8.4 ms; the compute thread waited 1.13 s in total over the ~11-minute bench. Short greedy prompts start cold (hit 59 % at the end of the det run).
+- Quality 10/10, needles 3/3, greedy 3/5 identical vs mmap (information only, §4.13).
+- In code `--ple-io` still defaults to `mmap`; the `_opt.sh` launcher defaults `PLE_IO=direct`. Whether the main launcher takes it is the user's decision (not done).
 
 ## 6. Where everything lives
 
@@ -109,10 +149,15 @@ Tuning already done (detail in the report): ub 512/640/768 trade cache capacity 
 ## 7. Highest-value leads for the rewrite
 
 1. **The +421 MiB CUDA0 step between ub 704 and 736.** Largest single lever: removing it drops ub768's 1754 MiB to ~1315 MiB, i.e. **+440 MiB of cache budget** (~+20 % cached expert rows) or headroom for a bigger ubatch. Needs per-node gallocr/allocator instrumentation at 704 vs 736, target and draft separately (the fork exposes no runtime scheduler-debug knob).
+   *Status 2026-10-08:* **mostly captured without being diagnosed.** `opt/rtx-mi50` cut the ub768 CUDA0 compute buffer 1754 → 944 MiB and the draft context 1493 → 498 MiB (§5.2), which moved the cache pools to 3506 MiB at ub1280. The discrete 704 → 736 step itself was never re-bisected, so its cause is still unknown.
 2. **Prefill is not GPU-bound.** ROCm0 compute scales 2.144 MiB/ubatch at 150k (indexer/QSA term), and the fork's own TODO in `llama-memory-hybrid-idx.cpp` says the QSA input build is O(n_kv) per ubatch per stream (~865 µs at 33k → ~3.9 ms at 150k).
+   *Status 2026-10-08:* **open, and P0 changed the picture.** Prefill is bounded by the ROCm0 stage (69–73 % of compute) and by input copies (23–24 % of a ubatch, ~11 GiB of expert weights uploaded per ubatch). The QSA input build is still O(n_kv) on the CPU (~4 ms per ubatch at 150k). P4 (overlap/stream the uploads) targets the copies and P7 (pooled indexer keys) the indexer/QSA term; neither is started.
 3. **Cache hit rate is only ~50 %** with 2139 MiB / 3075 slots. Levers: the step above; allocating the indexer-score buffer on the device with slack; shrinking per-token pp buffers.
+   *Status 2026-10-08:* **now 62–65 %** with 3506 MiB pools at ub1280 (§5.2). Remaining levers: draft KV q8_0 (+139 MiB, §5.3), heatmap persistence, and P5.
 4. **Wave64 portability**: fix stable top-k and audit other 32-lane assumptions; fix the f16/f32 `MUL_MAT_ID` ROCm fault (both with reproductions + tests).
+   *Status 2026-10-08:* **partly done, off-path either way.** `c4fe38c4d` fixed the stable-ties collect stride on wave64 and added a radix top-k for CCCL < 3.2. The 32-bit ballot-mask assumption is still **not audited**, and the f16/f32 `MUL_MAT_ID` ROCm0 fault is untouched.
 5. **Deferred**: HIP-owner cache (patch 0002), VBR (`GGML_HIP_NO_VMM=ON` by design), heatmap persistence (`MOE_CACHE_PROFILE=1`), turbo4 at long context.
+   *Status 2026-10-08:* all still unmeasured. turbo4 is now the **deployed KV default** (user edit) but has not been benchmarked or quality-checked at ub1280, at any context length; the §5 numbers are all q4_0.
 6. **Invariants to keep**: the pinned source + five patches, `--fit off`, the anchored override, 21 CPU blocks with cache auto, PLE lazy + prefetch off, the shared output head on CUDA0, and `_old.sh` runnable as rollback.
 
 ## 8. Quick start
@@ -133,48 +178,63 @@ python3 ~/Projects/qwen38-perf/buun-rtx-mi-kit/longctx.py --port 10000 --reps 79
 cd ~/Projects/qwen38-perf/buun-rtx-mi-kit && CACHE_PROVIDER=cuda BUILD_JOBS=6 bash build-linux.sh
 ```
 
-## 9. State at handoff (2026-09-24)
+## 9. State at handoff (2026-09-24, updated 2026-10-08)
 
-- A buun server **is running** on `:10000`, started 10:27 from the deployed launcher, with two
-  operator modifications on top of the validated baseline:
-  `-ctk turbo4 -ctv turbo4` and `--override-kv qwen4exp.attention.indexer.top_k=int:4096`.
-  Both are **unvalidated experiments** on this host: turbo4 was neutral at 8k/32k and never measured
-  at 140k; the indexer `top_k 4096` (GGUF default 2048) has not been benchmarked or quality-checked.
-  Do not treat this running configuration as the reference — the reference is §5 (q4_0/q4_0 KV,
-  `top_k` at its metadata default).
-- Nothing else of ours is running: no experiment drivers, no monitors, port free apart from that server.
-- Open questions left by the previous session: cause of the ub704→736 CUDA0 step; whether turbo4 helps
-  at ≥64k populated context; whether a larger indexer `top_k` changes quality or throughput; the two
-  off-path HIP kernel defects; heatmap persistence (stage D) never measured.
+The 2026-09-24 snapshot (a server on `:10000` with turbo4 and `top_k 4096`) is **obsolete**: the work in §5.2 replaced that setup.
+Everything below is from `scripts/rtx-mi50/REPORT.md` as of 2026-10-01 and the repo as of 2026-10-08.
+**The target host was not re-checked on 2026-10-08** — it may be offline, and a server may be running. Run `pgrep -a -x llama-server`
+before starting anything; only one server fits at 150k.
 
-## 10. Next steps what to do next
-┌─────┬────────────────────────────────────────────┬──────────────────────────────┬──────────────────────────┬──────────┐
-│  #  │                  Package                   │             Flag             │          Where           │ Rebuild  │
-│     │                                            │                              │                          │ on host  │
-├─────┼────────────────────────────────────────────┼──────────────────────────────┼──────────────────────────┼──────────┤
-│ P2  │ Greedy MTP verify on the GPU               │ --spec-gpu-argmax            │ server, common           │ 20 s     │
-├─────┼────────────────────────────────────────────┼──────────────────────────────┼──────────────────────────┼──────────┤
-│ P3  │ Draft length by measured cost, plus        │ --spec-policy cost,          │ common/speculative       │ 20 s     │
-│     │ copy-from-context drafts deeper than 3     │ --spec-mtp-depth             │                          │          │
-├─────┼────────────────────────────────────────────┼──────────────────────────────┼──────────────────────────┼──────────┤
-│ P4  │ Prefill expert streaming: pinned staging   │ --prefill-weight-stream R    │ ggml-backend scheduler + │ ~10 min  │
-│     │ ring, copy stream, prefetched weight slots │                              │  CUDA                    │          │
-├─────┼────────────────────────────────────────────┼──────────────────────────────┼──────────────────────────┼──────────┤
-│     │ Decode: share of cache misses computed on  │                              │                          │          │
-│ P5  │ the GPU. Reuses P4's copy stream and       │ --moe-cache-pcie-frac F,     │ moe-cache.cu, ggml-cpu,  │ ~10 min  │
-│     │ staging, plus a capped registration of the │ --pin-experts-gib N          │ loader                   │          │
-│     │  expert pages as pinned memory             │                              │                          │          │
-├─────┼────────────────────────────────────────────┼──────────────────────────────┼──────────────────────────┼──────────┤
-│     │ AVX2 kernels that compute iq2_s/iq3_s      │                              │                          │          │
-│ P6  │ experts for all tokens of a verify window  │ GGML_CPU_IQ_MT=1             │ ggml-cpu x86             │ ~2 min   │
-│     │ in one pass                                │                              │                          │          │
-├─────┼────────────────────────────────────────────┼──────────────────────────────┼──────────────────────────┼──────────┤
-│     │ Pooled indexer keys: finished blocks       │                              │                          │          │
-│ P7  │ stored once (f32 by default for exactness, │ --qsa-pooled-keys            │ indexer memory, qwen4exp │ CPU+GPU  │
-│     │  f16 optional), open tail recomputed from  │                              │                          │          │
-│     │ a small raw buffer                         │                              │                          │          │
-├─────┼────────────────────────────────────────────┼──────────────────────────────┼──────────────────────────┼──────────┤
-│     │ Long-context KV streaming: full KV in      │                              │ KV cache, new ggml op,   │          │
-│ P8  │ pinned RAM, a page cache in VRAM, a        │ --kv-resident N              │ CUDA+HIP                 │ ~25 min  │
-│     │ resolve kernel (CUDA and HIP wave64)       │                              │                          │          │
-└─────┴────────────────────────────────────────────┴──────────────────────────────┴──────────────────────────┴──────────┘
+**Deployed on the target**
+- Main launcher `~/Scripts/llama.cpp/RTX+MI_Qwen3.8-Flash-Next.sh` is the generated `opt` launcher: runtime
+  `~/Projects/buun-opt-rtx-mi50/runtime`, ub1280, `TOPK_OVERRIDE` empty (GGUF default 2048), log `llama-server-qwen38next-buun-opt.log`.
+  The only user edit: `KV_K/KV_V` default **turbo4** — **unmeasured at ub1280** (every §5.2 number is q4_0/q4_0). The systemd unit
+  `qwen-flash-llama.service` starts it; it was inactive on 2026-10-01.
+- `~/Scripts/llama.cpp/RTX+MI_Qwen3.8-Flash-Next_opt.sh` (repo copy: `scripts/rtx-mi50/`) is the same launcher plus the P1 knobs:
+  `PLE_IO=direct` default, `PLE_IO_THREADS=16`, and `SCHED_TIMING=N` (exports `GGML_SCHED_TIMING`, default 0 = off). Its KV default is also turbo4.
+  Rollback: `PLE_IO=mmap`, or `_old.sh` (pin runtime, ub768, turbo4, hardcoded `top_k=4096`).
+- The target runtime holds the P1 build (`d87edd0aa` + the kit patches). The later `6594ea436` (Windows test guards, O_DIRECT short-read guard) is not rebuilt there.
+
+**Branches**
+- `opt/rtx-mi50` — validated (§5.2), rooted at the pin `ed774445`, not at master. On remote `fork`.
+- `opt/strata-port` — P0 + P1 merged (`7be8c7400`); results in `REPORT.md` §9. On remote `fork`, with `strata/p0-measure` and `strata/p1-ple-direct`.
+- `strata/p6-avx2-compute` — **current implementation branch**: opt-in IQ2_S/IQ3_S AVX2 multi-token kernels, CPU dispatch, exact parity tests and target harness implemented locally on the integration base. Release AVX2/non-AVX2 tests pass; CPU MODULE builds. Local evidence and pending target gates are in `REPORT.md` §10 and the plan execution ledger. Target acceptance, rollout and merge remain pending; no target P6 measurements.
+
+**Open questions**
+- turbo4 KV: never measured at ub1280 or at ≥64k populated context, yet it is the deployed default. First check: bench + quality arms with `KV_K=turbo4 KV_V=turbo4` against the q4_0 ub1280 row in §5.2, and re-check free VRAM after load.
+- A larger indexer `top_k` (`TOPK_OVERRIDE=4096`): quality and throughput effect never measured.
+- Cause of the ub704 → 736 CUDA0 compute step: undiagnosed (§7.1).
+- Source of the run-to-run greedy non-determinism (§4.13).
+- The off-path HIP kernel defects (§7.4): wave64 ballot mask unaudited; f16/f32 `MUL_MAT_ID` fault.
+- Heatmap persistence (`MOE_CACHE_PROFILE=1`) and a `--moe-cache-cpu-overlap` sweep at the new cache budget: never measured.
+- Why `-t 12` loses ~7 t/s versus `-t 6`: not profiled.
+- Code follow-up: in `src/llama-ple-reader.cpp:143` the O_DIRECT short-read break is `got < job.len`; the proposed guard is `got % PLE_ALIGN != 0`. Not changed.
+
+## 10. Next steps — status of the Strata packages (2026-10-08)
+
+Packages come from `docs/superpowers/specs/2026-10-01-strata-port-design.md`: one plan per package, executed in order P0 → P8.
+"Rebuild" is the rebuild time on the host.
+
+| # | Package | Flag | Where | Rebuild | Status |
+|---|---|---|---|---|---|
+| P0 | Measurement: per-split scheduler timing, harness with I/O capture and greedy check | `GGML_SCHED_TIMING=N` | ggml-backend scheduler, `scripts/rtx-mi50/harness/` | n/a | **Done**, merged. Results §5.3 |
+| P1 | PLE table read by an O_DIRECT positioned-read reader instead of mmap | `--ple-io direct` | `src/llama-ple-reader.cpp`, qwen4exp | n/a | **Done, PASS**, merged. Results §5.4 |
+| P2 | Greedy MTP verify on the GPU | `--spec-gpu-argmax` | server, common | 20 s | Not started, no plan |
+| P3 | Draft length by measured cost, plus copy-from-context drafts deeper than 3 | `--spec-policy cost`, `--spec-mtp-depth` | common/speculative | 20 s | Not started, no plan |
+| P4 | Prefill expert streaming: pinned staging ring, copy stream, prefetched weight slots | `--prefill-weight-stream R` | ggml-backend scheduler + CUDA | ~10 min | Not started, no plan. P0 sizes it (below) |
+| P5 | Decode: share of cache misses computed on the GPU. Reuses P4's copy stream and staging, plus a capped registration of the expert pages as pinned memory | `--moe-cache-pcie-frac F`, `--pin-experts-gib N` | moe-cache.cu, ggml-cpu, loader | ~10 min | Not started, no plan. Depends on P4 |
+| P6 | AVX2 kernels that compute iq2_s/iq3_s experts for all tokens of a verify window in one pass | `GGML_CPU_IQ_MT=1` | ggml-cpu x86 | ~2 min | **Implemented and validated locally 2026-10-08**, branch `strata/p6-avx2-compute`; exact CPU tests + harness ready. Target quality/needles/memory/performance gates pending; default off, not adopted/merged |
+| P7 | Pooled indexer keys: finished blocks stored once (f32 by default for exactness, f16 optional), open tail recomputed from a small raw buffer | `--qsa-pooled-keys` | indexer memory, qwen4exp | CPU+GPU | Not started, no plan |
+| P8 | Long-context KV streaming: full KV in pinned RAM, a page cache in VRAM, a resolve kernel (CUDA and HIP wave64) | `--kv-resident N` | KV cache, new ggml op, CUDA+HIP | ~25 min | Not started, no plan |
+
+None of the P2–P5, P7 and P8 flags exist in the code yet. Write each package's plan first.
+
+**What the P0/P1 results change**
+- **P4 sizing:** input copies are ~24 % of a prefill ubatch (~11 GiB of expert weights per ubatch at ~15 GB/s), and ROCm0 compute is 69–73 % of prefill compute (§5.3). The sched timing is a serial sum, so it does not give the gain from overlap. Measure P4 end to end.
+- **Exactness gates:** the spec declares P2, P3, P4, P6, P7-f32 and P8 exact (token-identical greedy output against the flag-off arm). On this host that gate cannot be passed even flag-off against flag-off (2/5 identical, §4.13). End-to-end gate instead: `quality.py` 10/10, `longctx.py` needles 3/3, throughput within noise, same-session A/B. Kernel-level bit-parity tests (for example P6's AVX2 dot products against buun's existing ones) are still meaningful and stay exact.
+- **P6 implementation:** opt-in `GGML_CPU_IQ_MT=1`, x86 AVX2 only, IQ2_S/IQ3_S only, batches of 2–8 tokens (the MTP verify window) with at least two routed rows for an expert; larger prefill batches and the existing IQ panel path (≥ 8 rows per expert, which keeps precedence) keep the current code. It is a CPU-side decode feature, so it can only move tg, and it has no expected number yet. Controls: P6 off/on on the same build, ub768 and ub1280 reported separately, and `--ple-io mmap` and `direct` controls with PLE mode fixed while toggling.
+- **PLE direct as a default:** `--ple-io direct` is throughput-neutral and removes the 36.6 GiB table from the page cache (§5.4). The `_opt.sh` launcher already uses it; promoting it to the main launcher is the user's call.
+
+**Small wins outside the package list**
+- Draft KV q8_0 (`DRAFT_KV_K=q8_0 DRAFT_KV_V=q8_0`): +139 MiB expert cache at equal tg/pp (§5.3). Not adopted by the launchers.
+- Measure turbo4 against q4_0 at ub1280, then decide whether it stays the deployed default (§9).

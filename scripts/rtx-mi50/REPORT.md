@@ -380,3 +380,84 @@ New launcher `~/Scripts/llama.cpp/RTX+MI_Qwen3.8-Flash-Next_opt.sh` (repo: `scri
 already uses it: `PLE_IO=direct` is its default, and `SCHED_TIMING=N` is a diagnostic knob that exports
 `GGML_SCHED_TIMING=N` (default 0 = off). Rollback: `PLE_IO=mmap` with the same launcher, or the main
 `RTX+MI_Qwen3.8-Flash-Next.sh`.
+
+---
+
+## 10. P6 IQ2_S/IQ3_S AVX2 multi-token work (2026-10-08, local validation)
+
+P6 is implemented on `strata/p6-avx2-compute`, remains opt-in with `GGML_CPU_IQ_MT=1`, and is **not
+adopted or merged**. The LLM target is unavailable; no target connection, build, deployment, quality
+run or performance measurement was made for P6. Local timings are not target throughput evidence.
+The implementation sits on integration base `0eb737653b49dfd8822d92ca3095e944a1f40150`, preserving
+block-ranked QSA (`e4662b5d4`), the shared KQ-mask (`5542623ce`), MTP draft cap (`3ab2be1c6`) and P1.
+Record the final P6 commit, actual target source revision + kit patches, build-info and loaded module
+checksums before target comparisons; the previously documented P1 runtime is not a fresh baseline.
+
+The kernels reuse decoded weights across up to eight Q8_K activation rows while preserving buun's
+integer lanes, FMA order and horizontal reduction. CPU dispatch admits IQ2_S/IQ3_S only, an exact
+flag value `1`, AVX2/FMA, graph windows 2–8 and at least two remaining expert rows. Singletons and
+larger windows retain the existing path; IQ panels keep precedence, IQ4_NL stays unchanged and cache
+planning still removes successful GPU rows before CPU grouping. The feature adds bounded stack
+arrays, not a model-sized allocation. Target cache coexistence and memory limits still need testing.
+
+### Local evidence (development Ryzen 7 PRO 7840U; no discrete GPU)
+
+| Check | Observed result |
+|---|---|
+| Release, `GGML_NATIVE=OFF`, AVX2+FMA, AVX-512/VNNI off | Server, `test-backend-ops` and `test-llama-archs` built successfully |
+| Direct IQ2_S/IQ3_S MT vs existing vec_dot | Bitwise parity passed for widths 1–8, widths 256/512/2560 and deterministic random/edge inputs |
+| Saved-input graph parity, fresh flag-off/on CTest | 2/2 passed; 288 configurations: 2 formats × 2 input layouts × threads 1/6/12 × token counts 1/2/3/4/8/9 × routed slots 1/10 × 2 expert windows |
+| Release kernel argument guards | Both formats reject columns 0/9 and width 257 with `GGML_ASSERT` / SIGABRT |
+| Non-AVX2 final rebuild and fresh CTest | Build succeeded, 2/2 passed (scalar fallback) |
+| Dynamic backend final build | `ggml-cpu` MODULE rebuilt successfully; private-symbol executable is intentionally excluded |
+| Temporary CPU-library call coverage probe | Enabled graph fixtures made 29184 MT calls; unset, `0`, `true`, and empty flag each made 0; all retained exact parity |
+| CPU `MUL_MAT_ID` backend checks | IQ2_S/IQ3_S/IQ4_NL 11/11 passed in each flag-off/on process |
+| qwen4exp CPU smoke | PLE resize/rollback and MTP handoff contracts passed; CUDA VBR check skipped without GPU |
+| `test-cpu-iq-mt --bench` smoke | All 10 format/width timing rows completed with finite checksum `0x1.159f6a3cfacp+28`; tool validation only, different CPU and concurrent build load |
+| Driver syntax and temporary stub check | `bash -n` passed; 19 default and 29 ub1280+ub768+turbo4 arms verified, common env/counterbalancing/isolation checked, greedy mismatch continued, existing-server guard blocked every arm, unsupported ubatch rejected |
+
+The microbenchmark streams at least 256 MiB per format, projects width 2560 over 640 expert rows,
+uses token widths 1/2/3/4/8, warms up then takes five-pass medians and consumes a checksum. Run it
+on the target 7600X in a separate non-DL CPU build before interpreting timings. Windows shared
+builds skip the private-symbol test; Windows static builds can register it. Neither Windows build
+was validated in this session.
+
+### Target procedure and evidence still required
+
+Use `harness/p6_arms.sh` and its README. Build **both GPU backends** first into
+`~/Projects/buun-p6-rtx-mi50` with `OUT=... BUILD_JOBS=6 bash scripts/rtx-mi50/build.sh`. On later
+CPU iterations explicitly build `ggml-cpu llama-server test-backend-ops` in the isolated CUDA build
+and copy its `bin/` to the isolated `runtime/` while no server from it is running. Rebuilding only
+`llama-server` does not update the dynamically loaded CPU MODULE. Do not overwrite the deployed
+runtime, apply the HIP-owner patch, or change production PLE/KV defaults.
+
+Primary arms hold ub1280, batch 2048, context 150000, threads/batch threads 6, q4_0/q4_0 target and
+f16/f16 draft KV, MTP n=3, draft ubatch 256, top_k 2048 (empty override), cache EP 0 and scheduler
+timing off. Each PLE mode gets cache-auto off/on then on/off rounds, cache-off off/on throughput,
+and auto-cache off/on quality + 142k needles. Direct uses 16 I/O threads and row cache 1048576.
+The initial mmap cache-off off/off/on greedy runs have no throughput or iostat; mismatches are
+informational. Optional ub768 and turbo4 mmap throughput + quality results stay separately labeled.
+
+| Evidence to fill on the target | Current status |
+|---|---|
+| P6 source/build revision, kit diff, CPU module checksum, device/dependency checks | Pending |
+| Target direct/saved-input parity, scalar controls, CPU MODULE backend checks and cache coexistence | Pending |
+| 7600X DRAM microbenchmarks, shared-row coverage / matched CPU-op timing | Pending |
+| ub1280 mmap and direct cache-auto off/on medians, spread, five usable reps after boot prefill exclusion | Pending |
+| Cache-off paired throughput; optional ub768 and turbo4 results | Pending (optional controls do not replace primary gates) |
+| Draft acceptance/window lengths, cache hits/pools/dispatch/collect failures, major faults/read bytes | Pending |
+| Quality 10/10 and needles 3/3 at ~142k tokens for both PLE modes and optional turbo4 | Pending |
+| No OOM/cache errors, ROCm0 ≥~500 MiB free after load, peak RSS/VRAM and latency | Pending |
+| Reproducible same-session cache-auto tg gain beyond ~±2 t/s repetition noise; no pp/latency regression beyond noise | Pending |
+| Rollout decision / merge | Pending; keep the flag unset by default |
+
+`run_arm.sh` can return success after a failed startup/request. Inspect each `launcher.out`, server
+log, benchmark, quality/needle JSON and VRAM artifact; process exit alone never passes a gate.
+Compare P6 off/on on the **same new build in the same session**, separately for each PLE mode and
+codec. Historical §2/§8/§9 medians are context only; pp32k can drift ~2% across sessions. Retain at
+least five usable repetitions and rerun borderline tg changes. Kernel speed alone cannot establish
+adoption. Greedy identity is never required: strict gates are kernel/saved-input parity plus target
+quality, needles, memory and performance. A turbo4 rollout also needs its own off/on checks.
+
+Rollback: use `GGML_CPU_IQ_MT=0`, or unset it, and start a **fresh process**. No production launcher
+or default was changed; the old runtime and launchers remain the fallback.

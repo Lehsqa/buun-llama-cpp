@@ -2276,6 +2276,19 @@ struct mmid_row_mapping {
     int32_t i2;
 };
 
+#if defined(__AVX2__)
+static bool ggml_cpu_iq_mt_enabled(void) {
+    static atomic_int enabled = -1;
+    int value = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (value == -1) {
+        const char * env = getenv("GGML_CPU_IQ_MT");
+        value = env != NULL && strcmp(env, "1") == 0;
+        atomic_store_explicit(&enabled, value, memory_order_relaxed);
+    }
+    return value == 1;
+}
+#endif
+
 static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
@@ -2298,6 +2311,40 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+
+#if defined(__AVX2__)
+    if ((type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_S) &&
+        ids->ne[1] >= 2 && ids->ne[1] <= 8 && ir1_end - ir1_start >= 2 && ggml_cpu_iq_mt_enabled()) {
+        for (int64_t first = ir1_start; first < ir1_end; first += 8) {
+            const int count = MIN(8, ir1_end - first);
+            const void * acts[8];
+            float * outputs[8];
+            float dots[8];
+            for (int t = 0; t < count; ++t) {
+                const struct mmid_row_mapping mapping = MMID_MATRIX_ROW(cur_a, first + t);
+                const int64_t col = mapping.i1 % ne11;
+                acts[t] = (const char *) wdata +
+                    (src1_cont || src1->type != vec_dot_type ?
+                     (col + mapping.i2 * ne11) * row_size : col * nb11 + mapping.i2 * nb12);
+                outputs[t] = (float *) ((char *) dst->data + mapping.i1 * nb1 + mapping.i2 * nb2);
+            }
+            for (int64_t row = ir0_start; row < ir0_end; ++row) {
+                const void * weight = src0_cur + row * nb01;
+                if (count == 1) {
+                    vec_dot(ne00, dots, 0, weight, 0, acts[0], 0, 1);
+                } else if (type == GGML_TYPE_IQ2_S) {
+                    ggml_vec_dot_iq2_s_q8_K_mt(ne00, dots, weight, acts, count);
+                } else {
+                    ggml_vec_dot_iq3_s_q8_K_mt(ne00, dots, weight, acts, count);
+                }
+                for (int t = 0; t < count; ++t) {
+                    outputs[t][row] = dots[t];
+                }
+            }
+        }
+        return;
+    }
+#endif
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;

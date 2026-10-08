@@ -11,6 +11,9 @@
 extern "C" {
 #endif
 
+void ggml_vec_dot_iq2_s_q8_K_mt(int n, float * s, const void * vx, const void * const * vy, int ncols);
+void ggml_vec_dot_iq3_s_q8_K_mt(int n, float * s, const void * vx, const void * const * vy, int ncols);
+
 // Quantization
 void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);

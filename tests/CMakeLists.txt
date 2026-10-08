@@ -914,6 +914,17 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-col2im-1d.cpp)
 endif()
 
+# Windows shared DLLs do not expose the internal dot-product symbols used by this test.
+if (TARGET ggml-cpu AND NOT GGML_BACKEND_DL AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+    llama_build_and_test(test-cpu-iq-mt.cpp)
+    target_include_directories(test-cpu-iq-mt PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu)
+    target_link_libraries(test-cpu-iq-mt PRIVATE ggml-cpu)
+    set_tests_properties(test-cpu-iq-mt PROPERTIES ENVIRONMENT "GGML_CPU_IQ_MT=0")
+    add_test(NAME test-cpu-iq-mt-enabled COMMAND test-cpu-iq-mt)
+    set_tests_properties(test-cpu-iq-mt-enabled PROPERTIES ENVIRONMENT "GGML_CPU_IQ_MT=1")
+endif()
+
 # libmtmd
 set(LLAMA_TEST_NAME test-mtmd-c-api)
 llama_build_and_test(test-mtmd-c-api.c)
